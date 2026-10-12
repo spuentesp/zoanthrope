@@ -1,0 +1,16 @@
+[package]
+name = "zoanthrope"
+version = "0.1.0"
+edition = "2021"
+description = "Swarm-coordination MCP server: file claims, agent presence, filesystem leases, audit."
+license = "MIT"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+# float_roundtrip: claim timestamps must survive state.json bit-exactly.
+# The default fast float parser drifts 1 ULP, which made a conflict's
+# claimed_at differ from the value the grant response reported.
+serde_json = { version = "1", features = ["float_roundtrip"] }
+
+[profile.release]
+strip = true
