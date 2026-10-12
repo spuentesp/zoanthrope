@@ -1,0 +1,24 @@
+{
+  "name": "@spuentesp/zoanthrope",
+  "version": "0.1.0",
+  "description": "Swarm coordination: file claims, agent presence, postboard intentions, audit. MCP server + hook CLI.",
+  "keywords": [
+    "mcp",
+    "multi-agent",
+    "coordination",
+    "claims",
+    "presence",
+    "swarm"
+  ],
+  "license": "MIT",
+  "bin": {
+    "zoanthrope": "bin/zoanthrope"
+  },
+  "files": [
+    "bin/",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=16"
+  }
+}
