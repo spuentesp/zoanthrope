@@ -320,6 +320,24 @@ fn file_list(args: &Value, common_purpose: Option<&str>) -> Result<Vec<FileReq>,
     Ok(out)
 }
 
+/// The single path-identity boundary: every incoming spelling (CLI,
+/// MCP, hooks) becomes [`state::canonical_key`] before it touches a
+/// claim, a lease, or a postboard entry.
+fn canon(root: &Path, raw: &str) -> String {
+    state::canonical_key(root, raw)
+}
+
+fn canon_pairs(root: &Path, files: &[(String, Option<String>)]) -> Vec<(String, Option<String>)> {
+    files
+        .iter()
+        .map(|(p, purpose)| (canon(root, p), purpose.clone()))
+        .collect()
+}
+
+fn canon_list(root: &Path, files: &[String]) -> Vec<String> {
+    files.iter().map(|p| canon(root, p)).collect()
+}
+
 // ─── tools ──────────────────────────────────────────────────────────
 
 fn claim_files(root: &Path, args: &Value) -> Result<Value, String> {
@@ -439,6 +457,7 @@ fn post_intention(root: &Path, args: &Value) -> Result<Value, String> {
         .filter(|s| !s.is_empty())
         .ok_or_else(|| "post_intention: note is required".to_string())?;
     let files = optional_str_list(args, "files")?.unwrap_or_default();
+    let files = canon_list(root, &files);
     state::update(root, |s| {
         let now = state::now_unix();
         // Implicit registration keeps hooks frictionless.
@@ -484,7 +503,7 @@ fn update_post(root: &Path, args: &Value) -> Result<Value, String> {
     let status = optional_str(args, "status")?;
     let title = optional_str(args, "title")?;
     let note = optional_str(args, "note")?;
-    let files = optional_str_list(args, "files")?;
+    let files = optional_str_list(args, "files")?.map(|f| canon_list(root, &f));
     if status.is_none() && title.is_none() && note.is_none() && files.is_none() {
         return Err("update_post: nothing to update (status, title, note, or files)".into());
     }
@@ -537,7 +556,7 @@ fn remove_post(root: &Path, args: &Value) -> Result<Value, String> {
 
 fn rejoin_agent(root: &Path, args: &Value) -> Result<Value, String> {
     let agent = agent_id(args)?;
-    let files = optional_str_list(args, "files")?;
+    let files = optional_str_list(args, "files")?.map(|f| canon_list(root, &f));
     let mut report = state::update(root, |s| {
         let now = state::now_unix();
         s.register(&agent, "other", now);
@@ -653,6 +672,7 @@ fn cli_claim_inner(
     files: &[(String, Option<String>)],
     intent: ClaimIntent,
 ) -> Result<Value, String> {
+    let files = canon_pairs(root, files);
     state::update(root, |s| {
         let now = state::now_unix();
         let ttl = state::ttl_secs();
@@ -671,7 +691,7 @@ fn cli_claim_inner(
         // live foreign lease refuses the whole call.
         let mut taken: Vec<String> = Vec::new();
         if intent == ClaimIntent::Edit {
-            for (path, purpose) in files {
+            for (path, purpose) in &files {
                 match fs_lease::reassert(root, path, agent, intent.as_str(), purpose.as_deref()) {
                     Ok(_) => taken.push(path.clone()),
                     Err(c) => {
@@ -683,7 +703,7 @@ fn cli_claim_inner(
                 }
             }
         }
-        Ok(match s.claim(agent, files, intent, now, ttl) {
+        Ok(match s.claim(agent, &files, intent, now, ttl) {
             ClaimOutcome::Granted(granted) => grant_json(&granted),
             ClaimOutcome::Conflict(c) => c.to_json(),
         })
@@ -703,10 +723,11 @@ fn grant_json(granted: &[Claim]) -> Value {
 }
 
 fn cli_release_inner(root: &Path, agent: &str, files: &[String]) -> Value {
+    let files = canon_list(root, files);
     match state::update(root, |s| {
         let now = state::now_unix();
         s.register(agent, "other", now);
-        let released = s.release(agent, files, now);
+        let released = s.release(agent, &files, now);
         // Drop the matching filesystem leases too (rename-and-verify,
         // owner-only — a stranger's sentinel is put back).
         for path in &released {
@@ -1075,6 +1096,123 @@ mod tests {
 
         let unknown = call_tool(&root, "who_am_i", &json!({"agent_id": "ghost"})).unwrap();
         assert_eq!(unknown["ok"], false);
+    }
+
+    #[test]
+    fn same_file_under_every_spelling_is_one_claim() {
+        // Path identity (P0): the CLI/MCP boundary canonicalizes every
+        // incoming spelling to one workspace-root-relative key, so one
+        // file can never hold two claims under two spellings.
+        let root = temp_root("path-identity");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/a.rs"), "fn a() {}\n").unwrap();
+        let abs = root.join("src/a.rs").to_string_lossy().into_owned();
+
+        let grant = call_tool(
+            &root,
+            "claim_files",
+            &json!({"agent_id": "alpha", "files": ["src/a.rs"]}),
+        )
+        .unwrap();
+        assert_eq!(grant["ok"], true);
+        assert_eq!(grant["granted"][0]["path"], "src/a.rs");
+
+        for spelling in [
+            "./src/a.rs".to_string(),
+            abs.clone(),
+            "src/../src/a.rs".to_string(),
+            "src\\a.rs".to_string(),
+        ] {
+            let out = call_tool(
+                &root,
+                "claim_files",
+                &json!({"agent_id": "beta", "files": [spelling]}),
+            )
+            .unwrap();
+            assert_eq!(
+                out["ok"], false,
+                "spelling {spelling:?} must conflict with the held claim"
+            );
+            assert_eq!(out["holder"], "alpha", "spelling {spelling:?}");
+            assert_eq!(
+                out["path"], "src/a.rs",
+                "conflict must name the canonical key for {spelling:?}"
+            );
+        }
+
+        // Exactly one claim exists — the spellings never split it.
+        let listed = call_tool(&root, "list_claims", &json!({})).unwrap();
+        let claims = listed["claims"].as_array().unwrap();
+        assert_eq!(claims.len(), 1, "one file, one claim: {claims:?}");
+        assert_eq!(claims[0]["path"], "src/a.rs");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn distinct_files_stay_distinct_under_canonicalization() {
+        let root = temp_root("path-distinct");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/a.rs"), "a\n").unwrap();
+        std::fs::write(root.join("src/b.rs"), "b\n").unwrap();
+        let grant = call_tool(
+            &root,
+            "claim_files",
+            &json!({"agent_id": "alpha", "files": ["src/a.rs", "./src/b.rs"]}),
+        )
+        .unwrap();
+        assert_eq!(grant["ok"], true);
+        assert_eq!(grant["granted"].as_array().unwrap().len(), 2);
+        // `src/../src/b.rs` is b.rs, not a third file — re-claim of the
+        // same key, not a conflict.
+        let again = call_tool(
+            &root,
+            "claim_files",
+            &json!({"agent_id": "alpha", "files": ["src/../src/b.rs"]}),
+        )
+        .unwrap();
+        assert_eq!(again["ok"], true, "own re-claim under any spelling");
+        let listed = call_tool(&root, "list_claims", &json!({})).unwrap();
+        assert_eq!(listed["claims"].as_array().unwrap().len(), 2);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn release_and_postboard_share_the_canonical_key() {
+        let root = temp_root("path-release");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/a.rs"), "a\n").unwrap();
+        let abs = root.join("src/a.rs").to_string_lossy().into_owned();
+        call_tool(
+            &root,
+            "claim_files",
+            &json!({"agent_id": "alpha", "files": ["src/a.rs"]}),
+        )
+        .unwrap();
+        // Release under the absolute spelling frees the relative claim.
+        let rel = call_tool(
+            &root,
+            "claim_files",
+            &json!({"agent_id": "alpha", "mode": "release", "files": [abs]}),
+        )
+        .unwrap();
+        assert_eq!(rel["released"], json!(["src/a.rs"]));
+        let listed = call_tool(&root, "list_claims", &json!({})).unwrap();
+        assert_eq!(listed["claims"].as_array().unwrap().len(), 0);
+
+        // Postboard file refs are the same keys.
+        let posted = call_tool(
+            &root,
+            "post_intention",
+            &json!({
+                "agent_id": "alpha",
+                "title": "t",
+                "note": "n",
+                "files": [root.join("src/a.rs").to_string_lossy(), "src\\a.rs"]
+            }),
+        )
+        .unwrap();
+        assert_eq!(posted["post"]["files"], json!(["src/a.rs", "src/a.rs"]));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

@@ -92,6 +92,74 @@ fn posix(path: &str) -> String {
     path.replace('\\', "/")
 }
 
+/// The one canonical key for a workspace path — the single boundary
+/// every incoming spelling crosses (CLI, MCP, hooks): workspace-root
+/// relative, `/`-separated, `.`/`..`-resolved, and symlink-resolved
+/// through the deepest existing ancestor (claims may precede file
+/// creation, so a non-existent tail stays lexical). Paths outside the
+/// workspace stay absolute and normalized — they still collide with
+/// themselves, never with a workspace file. One file, one key, one
+/// claim.
+pub fn canonical_key(root: &Path, raw: &str) -> String {
+    let norm = posix(raw.trim());
+    if norm.is_empty() {
+        return String::new();
+    }
+    let joined = if Path::new(&norm).is_absolute() {
+        PathBuf::from(&norm)
+    } else {
+        root.join(&norm)
+    };
+    let resolved = resolve_existing_prefix(&lexical_normalize(&joined));
+    let root_abs = std::fs::canonicalize(root).unwrap_or_else(|_| lexical_normalize(root));
+    match resolved.strip_prefix(&root_abs) {
+        Ok(rel) if rel.as_os_str().is_empty() => ".".to_string(),
+        Ok(rel) => posix(&rel.to_string_lossy()),
+        Err(_) => posix(&resolved.to_string_lossy()),
+    }
+}
+
+/// Lexical `.`/`..` normalization — the fallback for paths that do not
+/// exist yet (claims may precede file creation).
+fn lexical_normalize(p: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for comp in p.components() {
+        match comp {
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            std::path::Component::CurDir => {}
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// Resolve symlinks through the deepest existing ancestor of `p` and
+/// re-append the (lexical) non-existent tail. `fs::canonicalize`
+/// requires the whole path to exist; a claim on a file about to be
+/// created still gets its parent's real location.
+fn resolve_existing_prefix(p: &Path) -> PathBuf {
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    let mut cur = p.to_path_buf();
+    loop {
+        if let Ok(canon) = std::fs::canonicalize(&cur) {
+            let mut out = canon;
+            for comp in tail.iter().rev() {
+                out.push(comp);
+            }
+            return out;
+        }
+        match (
+            cur.file_name().map(std::ffi::OsStr::to_os_string),
+            cur.pop(),
+        ) {
+            (Some(name), true) => tail.push(name),
+            _ => return lexical_normalize(p),
+        }
+    }
+}
+
 /// Claim intent. `Edit` is the stronger one; conflicts are symmetric
 /// around it: `edit` conflicts with anything, `read` conflicts with
 /// `edit` only (`formal/PresenceClaims.tla`, `Conflicts`).
@@ -1666,5 +1734,58 @@ mod tests {
         let nested = root.join("a/b/c");
         std::fs::create_dir_all(&nested).unwrap();
         assert_eq!(discover_root(&nested), root);
+    }
+
+    // ─── path identity ──────────────────────────────────────────────
+
+    #[test]
+    fn canonical_key_collapses_every_spelling_to_one() {
+        let root = temp_root("canon-spell");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/a.rs"), "a\n").unwrap();
+        let abs = root.join("src/a.rs").to_string_lossy().into_owned();
+        let spellings = [
+            "src/a.rs",
+            "./src/a.rs",
+            abs.as_str(),
+            "src/../src/a.rs",
+            "src\\a.rs",
+            "src/./a.rs",
+            "src/sub/../a.rs",
+        ];
+        for s in spellings {
+            assert_eq!(
+                canonical_key(&root, s),
+                "src/a.rs",
+                "spelling {s:?} must map to the canonical key"
+            );
+        }
+        // Distinct files stay distinct.
+        assert_eq!(canonical_key(&root, "src/b.rs"), "src/b.rs");
+        assert_ne!(
+            canonical_key(&root, "src/a.rs"),
+            canonical_key(&root, "src/b.rs")
+        );
+        // Outside the workspace: absolute and normalized, never
+        // conflated with a workspace file.
+        assert_eq!(canonical_key(&root, "/etc/hosts"), "/etc/hosts");
+        assert_eq!(canonical_key(&root, "/etc/./hosts"), "/etc/hosts");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn canonical_key_resolves_symlinks_but_tolerates_missing_files() {
+        let root = temp_root("canon-symlink");
+        std::fs::create_dir_all(root.join("real")).unwrap();
+        std::fs::write(root.join("real/a.rs"), "a\n").unwrap();
+        std::os::unix::fs::symlink(root.join("real"), root.join("link")).unwrap();
+        // Existing file behind a symlinked dir: same key as the real path.
+        assert_eq!(canonical_key(&root, "link/a.rs"), "real/a.rs");
+        // Claims may precede creation: a not-yet-existing file keeps a
+        // lexical tail but still resolves the existing prefix.
+        assert_eq!(canonical_key(&root, "link/new.rs"), "real/new.rs");
+        assert_eq!(canonical_key(&root, "brand/new.rs"), "brand/new.rs");
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
