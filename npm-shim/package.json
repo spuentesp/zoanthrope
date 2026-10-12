@@ -1,7 +1,8 @@
 {
   "name": "@spuentesp/zoanthrope",
   "version": "0.1.0",
-  "description": "Swarm coordination: file claims, agent presence, postboard intentions, audit. MCP server + hook CLI.",
+  "mcpName": "io.github.spuentesp/zoanthrope",
+  "description": "Swarm coordination: file claims, agent presence, postboard intentions, filesystem leases, audit. MCP server + hook CLI.",
   "keywords": [
     "mcp",
     "multi-agent",
@@ -11,14 +12,23 @@
     "swarm"
   ],
   "license": "MIT",
+  "homepage": "https://github.com/spuentesp/zoanthrope#readme",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/spuentesp/zoanthrope.git"
+  },
   "bin": {
-    "zoanthrope": "bin/zoanthrope"
+    "zoanthrope": "./bin/zoanthrope.js"
   },
   "files": [
     "bin/",
+    "scripts/",
     "README.md"
   ],
+  "scripts": {
+    "postinstall": "node scripts/install.js"
+  },
   "engines": {
-    "node": ">=16"
+    "node": ">=18.0.0"
   }
 }

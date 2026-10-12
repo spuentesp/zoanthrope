@@ -83,6 +83,13 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
             print!("{}", usage());
             Ok(ExitCode::SUCCESS)
         }
+        // The npm shim's install path verifies downloads with
+        // `zoanthrope --version`; keep the output exactly
+        // `zoanthrope <CARGO_PKG_VERSION>`.
+        "--version" | "-V" => {
+            println!("zoanthrope {}", env!("CARGO_PKG_VERSION"));
+            Ok(ExitCode::SUCCESS)
+        }
         other => Err(format!("unknown command '{other}'\n{}", usage())),
     }
 }
