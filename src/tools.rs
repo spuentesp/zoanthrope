@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use serde_json::{json, Value};
 
 use crate::fs_lease;
-use crate::state::{self, Claim, ClaimIntent, ClaimOutcome, RejoinReport};
+use crate::state::{self, Claim, ClaimIntent, ClaimOutcome, ContentStamp, RejoinReport};
 
 const DEFAULT_AUDIT_LIMIT: usize = 200;
 
@@ -41,13 +41,17 @@ pub fn tool_defs() -> Vec<Value> {
              response is the conflict shape {ok: false, holder, path, claimed_at, purpose, \
              holder_stale, intent}. Claims are all-or-nothing per call. A stale holder still \
              blocks — claims are never auto-released. A granted claim also takes the filesystem \
-             lease under .zoanthrope/locks/ (anti-clobbering).",
+             lease under .zoanthrope/locks/ (anti-clobbering) and binds the file's content \
+             fingerprint (mtime+size, sha256 for small files). stale_check=true (what the \
+             write guard passes) refuses with {ok: false, reason: 'stale-claim', holder} when \
+             the file changed under the caller's own claim — re-read, then re-claim to re-bind.",
             json!({
                 "type": "object",
                 "properties": {
                     "agent_id": {"type": "string", "description": "Calling agent's stable name"},
                     "mode": {"type": "string", "enum": ["claim", "release", "list"]},
                     "intent": {"type": "string", "enum": ["read", "edit"]},
+                    "stale_check": {"type": "boolean", "description": "Refuse a claim whose file changed since it was taken (guarded writes)"},
                     "files": {
                         "type": "array",
                         "items": {
@@ -348,9 +352,13 @@ fn claim_files(root: &Path, args: &Value) -> Result<Value, String> {
     match mode {
         "claim" => {
             let files = file_list(args, common_purpose)?;
+            let stale_check = args
+                .get("stale_check")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
             let pairs: Vec<(String, Option<String>)> =
                 files.into_iter().map(|f| (f.path, f.purpose)).collect();
-            cli_claim_inner(root, &agent, &pairs, intent)
+            cli_claim_inner(root, &agent, &pairs, intent, stale_check)
         }
         "release" => {
             let files = file_list(args, common_purpose)?;
@@ -627,13 +635,17 @@ fn get_audit_log(root: &Path, args: &Value) -> Result<Value, String> {
 // ─── CLI mirrors ────────────────────────────────────────────────────
 
 /// The `claim_files` body without JSON parsing — shared by the
-/// `zoanthrope claim` subcommand hooks shell out to.
+/// `zoanthrope claim` subcommand hooks shell out to. `stale_check`
+/// turns a fingerprint mismatch on the caller's own claim into a
+/// `stale-claim` refusal instead of a re-bind (what claim-guard.sh
+/// passes for every guarded write).
 pub fn cli_claim(
     root: PathBuf,
     agent: &str,
     files: &[String],
     purpose: Option<&str>,
     intent: Option<&str>,
+    stale_check: bool,
 ) -> Value {
     let intent = match intent {
         None => ClaimIntent::Edit,
@@ -646,7 +658,7 @@ pub fn cli_claim(
         .iter()
         .map(|f| (f.clone(), purpose.map(str::to_string)))
         .collect();
-    cli_claim_inner(&root, agent, &pairs, intent)
+    cli_claim_inner(&root, agent, &pairs, intent, stale_check)
         .unwrap_or_else(|e| json!({"ok": false, "error": e}))
 }
 
@@ -671,12 +683,32 @@ fn cli_claim_inner(
     agent: &str,
     files: &[(String, Option<String>)],
     intent: ClaimIntent,
+    stale_check: bool,
 ) -> Result<Value, String> {
     let files = canon_pairs(root, files);
     state::update(root, |s| {
         let now = state::now_unix();
         let ttl = state::ttl_secs();
         s.register(agent, "other", now);
+        // Fingerprint check for guarded writes: the agent's own claim
+        // must still describe the file's content. All-or-nothing; a
+        // stale claim is left untouched — the recovery is re-read then
+        // re-claim (a plain re-claim re-binds the fingerprint). No
+        // deliberate takeover exists: a foreign claim is a conflict.
+        if stale_check {
+            for (path, _) in &files {
+                let own = s
+                    .claims
+                    .iter()
+                    .find(|c| c.agent == agent && &c.path == path);
+                if let (Some(c), Some(stamp)) = (own, own.and_then(|c| c.fingerprint.as_ref())) {
+                    let cur = ContentStamp::capture(&abs_of(root, path));
+                    if !stamp.matches(&cur) {
+                        return Ok(stale_claim_json(agent, c));
+                    }
+                }
+            }
+        }
         let checks: Vec<(String, ClaimIntent)> =
             files.iter().map(|(p, _)| (p.clone(), intent)).collect();
         // Registry arbitration first (PresenceClaims). Nothing is
@@ -704,9 +736,44 @@ fn cli_claim_inner(
             }
         }
         Ok(match s.claim(agent, &files, intent, now, ttl) {
-            ClaimOutcome::Granted(granted) => grant_json(&granted),
+            ClaimOutcome::Granted(granted) => {
+                // Bind content at claim/re-claim time.
+                for (path, _) in &files {
+                    if let Some(c) = s
+                        .claims
+                        .iter_mut()
+                        .find(|c| c.agent == agent && &c.path == path)
+                    {
+                        c.fingerprint = Some(ContentStamp::capture(&abs_of(root, path)));
+                    }
+                }
+                grant_json(&granted)
+            }
             ClaimOutcome::Conflict(c) => c.to_json(),
         })
+    })
+}
+
+/// Resolve a canonical key back to a filesystem path: keys under the
+/// root are relative, foreign paths stay absolute.
+fn abs_of(root: &Path, key: &str) -> PathBuf {
+    if Path::new(key).is_absolute() {
+        PathBuf::from(key)
+    } else {
+        root.join(key)
+    }
+}
+
+/// The `stale-claim` refusal: the holder is the caller — the file
+/// changed under their own claim. Never a takeover; re-read, re-claim.
+fn stale_claim_json(agent: &str, claim: &Claim) -> Value {
+    json!({
+        "ok": false,
+        "reason": "stale-claim",
+        "holder": agent,
+        "path": claim.path,
+        "claimed_at": claim.claimed_at,
+        "hint": "re-read the file, then re-claim before writing",
     })
 }
 
@@ -1213,6 +1280,91 @@ mod tests {
         .unwrap();
         assert_eq!(posted["post"]["files"], json!(["src/a.rs", "src/a.rs"]));
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn guard_check_denies_a_stale_held_claim() {
+        // P1: a claim binds to the file's content at claim time. An
+        // out-of-band change under a held claim makes the next guarded
+        // write stale — DENY with `stale-claim` (holder is self) so the
+        // writer re-reads instead of clobbering.
+        let root = temp_root("stale-claim");
+        std::fs::write(root.join("f.txt"), "seed\n").unwrap();
+        call_tool(
+            &root,
+            "claim_files",
+            &json!({"agent_id": "alpha", "files": ["f.txt"]}),
+        )
+        .unwrap();
+        // out-of-band process appends — B's addition lands under the claim
+        std::fs::write(root.join("f.txt"), "seed\nbeta-new-line\n").unwrap();
+        let out = call_tool(
+            &root,
+            "claim_files",
+            &json!({"agent_id": "alpha", "files": ["f.txt"], "stale_check": true}),
+        )
+        .unwrap();
+        assert_eq!(out["ok"], false, "stale write must not pass: {out}");
+        assert_eq!(out["reason"], "stale-claim");
+        assert_eq!(out["holder"], "alpha", "holder is self");
+        assert_eq!(out["path"], "f.txt");
+        // the claim is left untouched — no silent takeover/refresh
+        let listed = call_tool(&root, "list_claims", &json!({})).unwrap();
+        assert_eq!(listed["claims"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn plain_reclaim_refreshes_and_then_guard_writes_pass() {
+        let root = temp_root("stale-recover");
+        std::fs::write(root.join("f.txt"), "seed\n").unwrap();
+        call_tool(
+            &root,
+            "claim_files",
+            &json!({"agent_id": "alpha", "files": ["f.txt"]}),
+        )
+        .unwrap();
+        std::fs::write(root.join("f.txt"), "seed\nbeta-new-line\n").unwrap();
+        // recovery protocol: re-read (not guarded), then re-claim — the
+        // re-claim re-binds the fingerprint to the current content
+        let reclaim = call_tool(
+            &root,
+            "claim_files",
+            &json!({"agent_id": "alpha", "files": ["f.txt"]}),
+        )
+        .unwrap();
+        assert_eq!(reclaim["ok"], true, "plain re-claim refreshes: {reclaim}");
+        let write = call_tool(
+            &root,
+            "claim_files",
+            &json!({"agent_id": "alpha", "files": ["f.txt"], "stale_check": true}),
+        )
+        .unwrap();
+        assert_eq!(write["ok"], true, "guarded write after re-claim: {write}");
+    }
+
+    #[test]
+    fn claim_write_release_roundtrip_is_unaffected_by_fingerprints() {
+        // The normal flow must never trip the check: claim → write →
+        // release, then the next claim is fresh again.
+        let root = temp_root("stale-roundtrip");
+        std::fs::write(root.join("f.txt"), "one\n").unwrap();
+        for i in 0..3 {
+            let guard = call_tool(
+                &root,
+                "claim_files",
+                &json!({"agent_id": "alpha", "files": ["f.txt"], "stale_check": true}),
+            )
+            .unwrap();
+            assert_eq!(guard["ok"], true, "window {i} must grant: {guard}");
+            std::fs::write(root.join("f.txt"), format!("write {i}\n")).unwrap();
+            let rel = call_tool(
+                &root,
+                "claim_files",
+                &json!({"agent_id": "alpha", "mode": "release", "files": ["f.txt"]}),
+            )
+            .unwrap();
+            assert_eq!(rel["ok"], true);
+        }
     }
 
     #[test]

@@ -201,6 +201,81 @@ fn intents_conflict(a: ClaimIntent, b: ClaimIntent) -> bool {
     a == ClaimIntent::Edit || b == ClaimIntent::Edit
 }
 
+/// A claim's content binding: the file's stamp at claim time. This is
+/// what makes a claim promise "the content I read is still there" and
+/// not just "nobody else may write".
+///
+/// Fingerprint rule (documented choice): `mtime_ns + size` always, plus
+/// `sha256` when the file is at most [`SHA_MAX_BYTES`] at capture time
+/// — cheap for small files, and it defeats same-size rewrites on
+/// filesystems with coarse mtimes. Comparison: content hash when both
+/// sides carry one (identical content is never stale), else
+/// `mtime_ns + size`. `exists: false` stamps a claim taken before the
+/// file was created; a file appearing later is a mismatch.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ContentStamp {
+    pub exists: bool,
+    #[serde(default)]
+    pub mtime_ns: i64,
+    #[serde(default)]
+    pub size: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
+}
+
+/// Files at most this size get a `sha256` in their [`ContentStamp`].
+pub const SHA_MAX_BYTES: u64 = 256 * 1024;
+
+impl ContentStamp {
+    /// The file's current stamp. A file that cannot be stated is
+    /// stamped `exists: false` (claim before creation is legal).
+    pub fn capture(path: &Path) -> Self {
+        let Ok(meta) = std::fs::metadata(path) else {
+            return Self {
+                exists: false,
+                mtime_ns: 0,
+                size: 0,
+                sha256: None,
+            };
+        };
+        let mtime_ns = meta
+            .modified()
+            .ok()
+            .and_then(|m| m.duration_since(UNIX_EPOCH).ok())
+            .map(|d| i64::try_from(d.as_nanos()).unwrap_or(i64::MAX))
+            .unwrap_or(0);
+        let size = meta.len();
+        let sha256 = if size <= SHA_MAX_BYTES {
+            std::fs::read(path)
+                .ok()
+                .map(|bytes| crate::sha256::sha256_hex(&bytes))
+        } else {
+            None
+        };
+        Self {
+            exists: true,
+            mtime_ns,
+            size,
+            sha256,
+        }
+    }
+
+    /// True when `self` (the claim's stamp) still describes `other`
+    /// (the file now): no stale content between claim and write.
+    pub fn matches(&self, other: &Self) -> bool {
+        if self.exists != other.exists {
+            return false;
+        }
+        if !self.exists {
+            return true;
+        }
+        match (&self.sha256, &other.sha256) {
+            (Some(a), Some(b)) => a == b,
+            _ => self.mtime_ns == other.mtime_ns && self.size == other.size,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Claim {
     pub path: String,
@@ -210,6 +285,10 @@ pub struct Claim {
     pub claimed_at: f64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub purpose: Option<String>,
+    /// Content stamp recorded at claim (or re-claim) time; `None` on a
+    /// claim recorded before fingerprinting existed — never checked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fingerprint: Option<ContentStamp>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -524,6 +603,7 @@ impl State {
                         intent: *intent,
                         claimed_at: now,
                         purpose: purpose.clone(),
+                        fingerprint: None,
                     };
                     self.claims.push(c.clone());
                     granted.push(c);
@@ -1786,6 +1866,79 @@ mod tests {
         // lexical tail but still resolves the existing prefix.
         assert_eq!(canonical_key(&root, "link/new.rs"), "real/new.rs");
         assert_eq!(canonical_key(&root, "brand/new.rs"), "brand/new.rs");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ─── content fingerprints ───────────────────────────────────────
+
+    #[test]
+    fn content_stamp_binds_and_detects_out_of_band_changes() {
+        let root = temp_root("stamp");
+        let f = root.join("f.txt");
+        std::fs::write(&f, "seed\n").unwrap();
+        let s0 = ContentStamp::capture(&f);
+        assert!(s0.exists);
+        assert!(s0.matches(&s0.clone()), "an unchanged file matches");
+        assert!(s0.sha256.is_some(), "small files carry a content hash");
+
+        // Same content rewritten: the hash keeps this from being stale
+        // even when the mtime moved.
+        std::fs::write(&f, "seed\n").unwrap();
+        let s1 = ContentStamp::capture(&f);
+        assert!(s0.matches(&s1), "identical content is never stale");
+
+        // The out-of-band append — the P1 hole.
+        std::fs::write(&f, "seed\nbeta-new-line\n").unwrap();
+        let s2 = ContentStamp::capture(&f);
+        assert!(!s0.matches(&s2), "content change under the claim is stale");
+        assert!(s2.matches(&s2.clone()));
+
+        // Claim-before-create: absent stamps match each other, and a
+        // file appearing or vanishing later is a mismatch.
+        let absent = ContentStamp::capture(&root.join("nope.txt"));
+        assert!(!absent.exists);
+        assert!(absent.matches(&ContentStamp::capture(&root.join("nope.txt"))));
+        assert!(!absent.matches(&s2), "created later is stale");
+        assert!(!s2.matches(&absent), "deleted later is stale");
+
+        // Large files fall back to mtime+size (the documented rule).
+        let big = root.join("big.bin");
+        std::fs::write(&big, vec![7u8; (SHA_MAX_BYTES + 1) as usize]).unwrap();
+        let b0 = ContentStamp::capture(&big);
+        assert!(b0.sha256.is_none(), "big files skip the hash");
+        assert!(b0.matches(&ContentStamp::capture(&big)));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn claim_fingerprint_survives_the_state_roundtrip() {
+        let root = temp_root("stamp-roundtrip");
+        let f = root.join("f.txt");
+        std::fs::write(&f, "seed\n").unwrap();
+        let mut s = State::default();
+        s.register("alpha", "claude", 1_000.0);
+        s.claim(
+            "alpha",
+            &[("f.txt".into(), None)],
+            ClaimIntent::Edit,
+            1_000.0,
+            900,
+        );
+        s.claims[0].fingerprint = Some(ContentStamp::capture(&f));
+        save(&root, &s).unwrap();
+        let loaded = load(&root).unwrap();
+        assert_eq!(loaded.claims, s.claims, "fingerprint is on-disk state");
+        assert!(loaded.claims[0].fingerprint.as_ref().unwrap().exists);
+        // An older state without a fingerprint still loads (None = never
+        // checked).
+        let raw = serde_json::to_string(&s).unwrap();
+        let mut v: Value = serde_json::from_str(&raw).unwrap();
+        v["claims"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("fingerprint");
+        let legacy: State = serde_json::from_value(v).unwrap();
+        assert!(legacy.claims[0].fingerprint.is_none());
         let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -8,5 +8,6 @@
 pub mod bash_parse;
 pub mod fs_lease;
 pub mod mcp;
+pub mod sha256;
 pub mod state;
 pub mod tools;

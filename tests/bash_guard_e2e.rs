@@ -224,6 +224,71 @@ fn mutation_files_cli_handles_relative_workspace() {
 }
 
 #[test]
+fn stale_held_claim_denies_the_guard_write() {
+    // P1: a claim binds to content. An out-of-band append under a held
+    // claim must make the next guarded write stale — denied with
+    // `stale-claim` (holder is self) instead of clobbering — and the
+    // recovery (re-read, re-claim) re-binds the fingerprint.
+    let ws = scratch("stale");
+    let log = ws.join("hook.log");
+    let f = ws.join("shared/config.yaml");
+    // alpha claims the file and reads it at t0
+    assert!(
+        claim_cli(&ws, "alpha", f.to_str().unwrap()),
+        "alpha's claim must be granted"
+    );
+    // out-of-band process appends — beta's addition lands under the claim
+    fs::write(&f, "version = 2\nbeta-new-line\n").expect("out-of-band append");
+    // a write through the guard with stale content must be DENIED
+    let (stdout, stderr, code) = run_hook(
+        "claim-guard.sh",
+        &ws,
+        "alpha",
+        &edit_input(&ws, "shared/config.yaml"),
+        &log,
+    );
+    assert_eq!(
+        code, 2,
+        "stale write must deny (exit 2); stdout={stdout} stderr={stderr}"
+    );
+    assert!(
+        stdout.contains("stale-claim") && stderr.contains("stale-claim"),
+        "denial must say stale-claim: stdout={stdout} stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("re-read") && stderr.contains("re-claim"),
+        "the message must name the recovery: {stderr}"
+    );
+    // the file was not touched — beta's line survives
+    assert_eq!(
+        fs::read_to_string(&f).unwrap(),
+        "version = 2\nbeta-new-line\n",
+        "stale content must never clobber"
+    );
+    // recovery protocol: re-read (simulated by the fresh read above),
+    // then re-claim — the re-claim re-binds the fingerprint
+    assert!(
+        claim_cli(&ws, "alpha", f.to_str().unwrap()),
+        "plain re-claim refreshes the fingerprint"
+    );
+    let (stdout, _stderr, code) = run_hook(
+        "claim-guard.sh",
+        &ws,
+        "alpha",
+        &edit_input(&ws, "shared/config.yaml"),
+        &log,
+    );
+    assert_eq!(code, 0, "guarded write after re-claim must pass: {stdout}");
+    // the refusal is audited as its own class, not a silent drop
+    let log_body = fs::read_to_string(&log).expect("hook log");
+    assert!(
+        log_body.contains("stale-claim"),
+        "stale-claim must be audited: {log_body}"
+    );
+    let _ = fs::remove_dir_all(&ws);
+}
+
+#[test]
 fn unparseable_mutation_is_reported_unclaimed() {
     let ws = scratch("watch");
     let log = ws.join("hook.log");

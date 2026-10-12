@@ -41,6 +41,7 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
                 &c.files,
                 c.purpose.as_deref(),
                 c.intent.as_deref(),
+                c.stale_check,
             );
             println!(
                 "{}",
@@ -112,7 +113,9 @@ fn usage() -> String {
      usage:\n\
      \x20 zoanthrope mcp [--workspace DIR]        stdio MCP server\n\
      \x20 zoanthrope status [--workspace DIR]     text summary of claims/agents/posts\n\
-     \x20 zoanthrope claim --files a.rs,b.rs --agent X [--purpose P] [--intent read|edit] [--workspace DIR]\n\
+     \x20 zoanthrope claim --files a.rs,b.rs --agent X [--purpose P] [--intent read|edit] [--stale-check] [--workspace DIR]\n\
+     \x20   --stale-check refuses a claim whose file changed since the\n\
+     \x20   caller's own claim was taken (stale-claim; re-read, re-claim)\n\
      \x20 zoanthrope release --files a.rs,b.rs --agent X [--workspace DIR]\n\
      \x20 zoanthrope rejoin --agent X [--files a.rs,b.rs] [--workspace DIR]\n\
      \x20 zoanthrope mutation-files --command CMD [--cwd DIR] [--workspace DIR]\n\
@@ -218,6 +221,7 @@ struct ClaimArgs {
     files: Vec<String>,
     purpose: Option<String>,
     intent: Option<String>,
+    stale_check: bool,
 }
 
 impl ClaimArgs {
@@ -227,6 +231,7 @@ impl ClaimArgs {
         let mut purpose: Option<String> = None;
         let mut intent: Option<String> = None;
         let mut workspace: Option<PathBuf> = None;
+        let mut stale_check = false;
         let mut i = 0;
         while i < args.len() {
             let (flag, value) = {
@@ -267,6 +272,10 @@ impl ClaimArgs {
                     intent = Some(take(value, "--intent")?);
                     i += 2;
                 }
+                "--stale-check" => {
+                    stale_check = true;
+                    i += 1;
+                }
                 "--workspace" | "-w" => {
                     workspace = Some(PathBuf::from(take(value, "--workspace")?));
                     i += 2;
@@ -294,6 +303,7 @@ impl ClaimArgs {
             files,
             purpose,
             intent,
+            stale_check,
         })
     }
 }

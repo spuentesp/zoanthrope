@@ -28,6 +28,15 @@
 # `unclaimed-mutation` audit line. That is the trail for unparseable
 # commands — the guard never blocks what it cannot see.
 #
+# Content binding (stale-claim): every claim records the file's content
+# fingerprint (mtime+size, sha256 for small files). The claim below
+# passes --stale-check, so a file that changed under the caller's OWN
+# claim — an out-of-band append, a generator run — is refused with a
+# `stale-claim` denial (holder is self) instead of being written over
+# stale content. Recovery: re-read the file, then re-claim (a plain
+# `zoanthrope claim` re-binds the fingerprint). Advisory mode never
+# denies: the staleness warning goes to stderr and the call proceeds.
+#
 # Env:
 #   ZOANTHROPE_WORKSPACE  workspace root (default: git toplevel / pwd)
 #   ZOANTHROPE_BIN        zoanthrope binary (default: on PATH)
@@ -104,13 +113,17 @@ fi
 if [ -z "$COMMA" ]; then exit 0; fi
 
 RESULT="$("$ZOO" claim --files "$COMMA" --agent "$AGENT" --intent edit \
-    --workspace "$WS_ROOT" 2>/dev/null)"
+    --stale-check --workspace "$WS_ROOT" 2>/dev/null)"
 OK="$(printf '%s' "$RESULT" | python3 -c '
 import json, sys
 try:
-    print("true" if json.load(sys.stdin).get("ok") else "false")
+    d = json.load(sys.stdin)
 except Exception:
-    print("false")' 2>/dev/null)"
+    d = {}
+print("true" if d.get("ok") else "false")
+print(d.get("reason") or "")' 2>/dev/null)"
+REASON="$(printf '%s\n' "$OK" | sed -n 2p)"
+OK="$(printf '%s\n' "$OK" | sed -n 1p)"
 
 # Per-file audit line (the shape the A/B metrics reader consumes).
 printf '%s' "$RESULT" | ZOO_GUARD_TS="$TS" ZOO_GUARD_AGENT="$AGENT" \
@@ -132,13 +145,16 @@ rows = (
 for path, body in rows:
     if not path:
         continue
+    result = "grant" if ok else (
+        "stale-claim" if (claim or {}).get("reason") == "stale-claim" else "conflict"
+    )
     entry = {
         "ts": float(os.environ.get("ZOO_GUARD_TS", "0")),
         "hook": "pre",
         "agent": os.environ.get("ZOO_GUARD_AGENT", "unknown"),
         "tool": os.environ.get("ZOO_GUARD_TOOL", ""),
         "file": path,
-        "result": "grant" if ok else "conflict",
+        "result": result,
         "claim": body,
     }
     with open(log, "a") as f:
@@ -151,6 +167,9 @@ if [ "$MODE" = "advisory" ]; then
     # Advisory = pre-edit.sh behavior: report the claim or conflict JSON
     # on stderr and let the tool call through — never deny, exit 0.
     printf '%s\n' "$RESULT" >&2
+    if [ "$REASON" = "stale-claim" ]; then
+        printf 'zoanthrope: stale-claim — the file changed since your claim; re-read, then re-claim before writing.\n' >&2
+    fi
     exit 0
 fi
 
@@ -166,8 +185,12 @@ except Exception:
     claim = {}
 path = claim.get("path", "?")
 holder = claim.get("holder", "unknown")
-reason = ("zoanthrope: '\''%s'\'' is claimed by '\''%s'\'' — edit denied. "
-          "Wait, then retry (max 3 retries).") % (path, holder)
+if claim.get("reason") == "stale-claim":
+    reason = ("zoanthrope: '\''%s'\'' changed since your claim (stale-claim) — "
+              "re-read the file, then re-claim before writing.") % path
+else:
+    reason = ("zoanthrope: '\''%s'\'' is claimed by '\''%s'\'' — edit denied. "
+              "Wait, then retry (max 3 retries).") % (path, holder)
 print(json.dumps({"hookSpecificOutput": {
     "hookEventName": "PreToolUse",
     "permissionDecision": "deny",

@@ -299,6 +299,32 @@ fn advisory_mode_still_claims_the_file() {
 }
 
 #[test]
+fn advisory_mode_warns_on_stale_claim_but_never_denies() {
+    // Advisory stays non-blocking on staleness, but the warning is
+    // printed to stderr — the hole is visible even when nothing denies.
+    let ws = scratch("stale-advisory");
+    let file = ws.join("shared/a.txt");
+    assert!(claim_cli(&ws, "alpha", file.to_str().unwrap()));
+    fs::write(&file, "seed\nbeta-new-line\n").expect("out-of-band append");
+    let (stdout, stderr, code) = run_guard(
+        &ws,
+        "alpha",
+        &edit_input(&ws, "shared/a.txt"),
+        &[("ZOANTHROPE_MODE", "advisory")],
+    );
+    assert_eq!(code, 0, "advisory must never deny: stdout={stdout}");
+    assert!(
+        !stdout.contains("permissionDecision") && !stdout.contains("deny"),
+        "no deny JSON on stdout: {stdout}"
+    );
+    assert!(
+        stderr.contains("stale-claim") && stderr.contains("re-read"),
+        "staleness warning must reach stderr: {stderr}"
+    );
+    let _ = fs::remove_dir_all(&ws);
+}
+
+#[test]
 fn blocking_unchanged_env_wins_over_advisory_config() {
     let ws = scratch("blocking");
     write_config(&ws, r#"{"mode": "advisory"}"#);
