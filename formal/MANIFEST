@@ -1,0 +1,19 @@
+# cfg-basename | module | expect | meaning
+#
+# expect=pass : TLC must finish with no error (exit 0).
+# expect=fail : TLC must report an INVARIANT/property violation (exit 12).
+#               These are negative controls and documented residuals:
+#               each models a pre-fix or rejected design and is kept so
+#               the bug stays reproducible. The checker is green when
+#               every outcome matches its expectation.
+PresenceClaims                    | PresenceClaims                    | pass | claim arbitration: no conflicting holders (strongest recorded intent)
+PresenceClaims_LastWins           | PresenceClaims                    | fail | negative control: last claim hides strongest intent (finding #3)
+FsLease                           | FsLease                           | fail | negative control: scan-then-create acquire, all acquirers win
+FsLease_Excl                      | FsLease                           | pass | fixed-path create_new lease, no expiry (mutual exclusion)
+FsLease_ExclExpiry                | FsLease                           | fail | residual: expiry + steal needs fencing tokens
+FsLeaseGuard_Unguarded            | FsLeaseGuard                      | fail | negative control: unguarded scan-then-create
+FsLeaseGuard                      | FsLeaseGuard                      | pass | O_EXCL acquire guard serializes the scan-then-create
+FsLeaseGuard_Stall                | FsLeaseGuard                      | fail | residual: guard holder frozen past GUARD_TTL
+RejoinProtocol                    | RejoinProtocol                    | fail | negative control: clear-after-read rejoin loses a writer's mark
+RejoinProtocol_VariantB           | RejoinProtocol_VariantB           | pass | fixed rejoin: clear-before-read, Convergence holds
+RejoinProtocolMidRejoinInvariant  | RejoinProtocolMidRejoinInvariant  | fail | NoLostUpdate is transiently false mid-rejoin (clear-before-read cost)
