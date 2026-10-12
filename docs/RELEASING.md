@@ -117,6 +117,9 @@ To submit (owner action, after the npm package exists):
    `github.com/modelcontextprotocol/registry/releases`):
 
    ```sh
+   # NOTE: get mcp-publisher ONLY from these GitHub releases or Homebrew.
+   # The npm package named "mcp-publisher" is a different, unrelated tool
+   # (the name is squatted) — never `npm i -g mcp-publisher`.
    curl -fsSL -o mcp-publisher.tar.gz \
      "https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_linux_amd64.tar.gz"
    tar xzf mcp-publisher.tar.gz mcp-publisher
