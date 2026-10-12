@@ -3,7 +3,12 @@
 All notable changes to zoanthrope. Versions follow `vX.Y.Z` git tags
 (see `docs/RELEASING.md`).
 
+## 0.1.1 — 2026-10-12
+
+- npm shim: `bin` entry repaired (npm requires `./`-prefixed bin paths; 0.1.0 shipped without the `zoanthrope` command linked). 0.1.1 supersedes it.
+
 ## 0.1.0 — 2026-10-12
+
 
 First release.
 
