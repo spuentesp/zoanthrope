@@ -67,6 +67,17 @@ its claims are `held_by_stale`, and they still **block** — claims are
 never auto-released; forcing one open is a policy this product did not
 make.
 
+A claim also binds the file's **content**: at claim (or re-claim) time
+it records a content fingerprint — `mtime+size` always, plus `sha256`
+for files ≤ 256 KiB, so same-size rewrites on coarse filesystems are
+still caught. Every guarded write (the hook family) checks the file
+against the claim's fingerprint first: if the file changed under the
+claim — an out-of-band append, a generator run — the write is refused
+with a `stale-claim` denial (holder is self) telling the agent to
+re-read and re-claim. Re-claiming re-binds the fingerprint to the
+current content; `release` drops it. No deliberate takeover exists: a
+claim lock is a content promise, not just a writer lock.
+
 ### Filesystem leases (anti-clobbering)
 
 A granted **edit** claim also takes a filesystem lease under
@@ -224,8 +235,14 @@ Presence TTL defaults to 15 minutes; `ZOANTHROPE_TTL_SECS` overrides.
 ## Performance
 
 *Decide in nanoseconds, persist in microseconds, scale to 128
-concurrent agents without losing a write.* All numbers measured on
-this machine; each family reproduces with the command named.
+concurrent agents without losing a write.* The guarantee covers write
+paths that go through the guarded hooks (`Edit`/`Write`/`MultiEdit`
+and recognized `Bash` mutations); unparseable commands are audited as
+`unclaimed-mutation` rather than blocked, and generator scripts
+(`node script.js`) are not automatically covered unless they write
+through recognized idioms — the audit trail remains the safety net.
+All numbers measured on this machine; each family reproduces with the
+command named.
 
 **Latency** — `cargo run --release --bin zoo-bench`:
 
