@@ -1,0 +1,282 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  # Escape hatch for a stuck/failed npm publish on an already-cut
+  # release: re-publishes the npm package for an existing tag without
+  # rebuilding binaries or touching the GitHub Release.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing release tag to (re-)publish to npm, e.g. v0.1.0. Its GitHub Release must already exist with assets.'
+        required: true
+        type: string
+
+# Top-level `permissions: {}` denies everything by default; each job
+# grants only what it needs.
+permissions: {}
+
+jobs:
+  # A tag can be pushed onto any commit, including one CI never ran on
+  # or one CI failed on. Without this gate, `git tag v0.1.0 && git push
+  # origin v0.1.0` would ship binaries built from unverified source.
+  # `github.sha` on a tag-push event is already the target commit.
+  ci-status-check:
+    name: Verify tagged commit passed CI
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - name: Require a completed, successful CI run on main for this commit
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SHA: ${{ github.sha }}
+        run: |
+          # `branch=main&event=push` requires the run that actually
+          # executed on main (a PR run is not enough). `status=completed`
+          # keeps a queued/in-progress re-run from outranking an earlier
+          # finished success in the default most-recent-first ordering.
+          CONCLUSION=$(gh api "repos/${{ github.repository }}/actions/workflows/ci.yml/runs?head_sha=${SHA}&branch=main&event=push&status=completed&per_page=1" \
+            --jq '.workflow_runs[0].conclusion // "none"')
+          echo "CI conclusion for commit $SHA on main: $CONCLUSION"
+          if [ "$CONCLUSION" != "success" ]; then
+            echo "::error::No successful, completed 'push' CI run on 'main' found for tagged commit $SHA (conclusion: $CONCLUSION)."
+            exit 1
+          fi
+
+  # The tag version must match every place the version is recorded:
+  # Cargo.toml, npm-shim/package.json, and server.json (top level and
+  # each packages[].version). No silent rewrite at publish time — if
+  # the tree drifted from the tag, the release fails here.
+  version-check:
+    needs: ci-status-check
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Verify tag matches Cargo.toml, npm-shim and server.json
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          python3 - <<'PY'
+          import json, os, re, sys
+
+          tag = os.environ["TAG"]
+          if not re.fullmatch(r"v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?", tag):
+              sys.exit(f"tag {tag!r} is not vX.Y.Z or vX.Y.Z-suffix")
+          version = tag[1:]
+
+          cargo = open("Cargo.toml", encoding="utf-8").read()
+          m = re.search(r'(?m)^version = "([^"]+)"', cargo)
+          pkg = json.load(open("npm-shim/package.json", encoding="utf-8"))
+          srv = json.load(open("server.json", encoding="utf-8"))
+
+          mismatches = []
+          if not m or m.group(1) != version:
+              mismatches.append(f"Cargo.toml: {m.group(1) if m else 'missing'}")
+          if pkg.get("version") != version:
+              mismatches.append(f"npm-shim/package.json: {pkg.get('version')}")
+          if srv.get("version") != version:
+              mismatches.append(f"server.json: {srv.get('version')}")
+          for p in srv.get("packages", []):
+              if p.get("version") != version:
+                  mismatches.append(f"server.json packages[{p.get('identifier')}]: {p.get('version')}")
+          if mismatches:
+              sys.exit("version drift vs tag " + tag + ": " + "; ".join(mismatches))
+          print(f"all version fields match {tag}")
+          PY
+
+  # Prebuilt binaries for the four supported targets. macOS x86_64 is
+  # cross-compiled on the arm64 runner (the Apple SDK is universal); the
+  # Linux aarch64 cell runs on GitHub's free arm64 runner.
+  build:
+    name: Build (${{ matrix.target }})
+    needs: version-check
+    if: github.event_name == 'push'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - os: macos-latest
+            target: x86_64-apple-darwin
+          - os: macos-latest
+            target: aarch64-apple-darwin
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
+        with:
+          toolchain: stable
+      - run: rustup target add ${{ matrix.target }}
+      - name: Build release binary
+        run: cargo build --release --target ${{ matrix.target }}
+      - name: Package tarball + per-artifact sha256
+        run: |
+          set -euo pipefail
+          stage="${RUNNER_TEMP}/stage"
+          mkdir -p "$stage"
+          cp "target/${{ matrix.target }}/release/zoanthrope" "$stage/zoanthrope"
+          chmod 755 "$stage/zoanthrope"
+          # Asset name contract (npm-shim/scripts/runtime.js downloads
+          # exactly this): zoanthrope-{target}.tar.gz with the bare
+          # `zoanthrope` binary at the archive root.
+          tar czf "zoanthrope-${{ matrix.target }}.tar.gz" -C "$stage" zoanthrope
+          python3 -c "import hashlib,pathlib,sys; p=pathlib.Path(sys.argv[1]); p.with_name(p.name+'.sha256').write_text(hashlib.sha256(p.read_bytes()).hexdigest()+'  '+p.name+'\n')" "zoanthrope-${{ matrix.target }}.tar.gz"
+          cat "zoanthrope-${{ matrix.target }}.tar.gz.sha256"
+      - uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        with:
+          name: zoanthrope-${{ matrix.target }}
+          path: |
+            zoanthrope-${{ matrix.target }}.tar.gz
+            zoanthrope-${{ matrix.target }}.tar.gz.sha256
+          if-no-files-found: error
+
+  # Aggregate the per-binary tarballs into one SHA256SUMS file and cut
+  # the GitHub Release in a single step — the release exists only after
+  # EVERY build succeeded (no partial releases). The npm shim verifies
+  # downloads against this SHA256SUMS.
+  release:
+    name: Create GitHub Release
+    needs: build
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: Compute aggregate SHA256SUMS
+        run: |
+          set -euo pipefail
+          cd artifacts
+          sha256sum zoanthrope-*.tar.gz > SHA256SUMS
+          cat SHA256SUMS
+      - name: Compose release notes
+        run: |
+          set -euo pipefail
+          sed -e "s/{{VERSION}}/${GITHUB_REF_NAME#v}/g" -e "s/{{TAG}}/${GITHUB_REF_NAME}/g" \
+            docs/release-notes-template.md > "${RUNNER_TEMP}/notes.md"
+          cat "${RUNNER_TEMP}/notes.md"
+      - uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+        with:
+          name: zoanthrope ${{ github.ref_name }}
+          body_path: ${{ runner.temp }}/notes.md
+          fail_on_unmatched_files: true
+          draft: false
+          files: |
+            artifacts/zoanthrope-*.tar.gz
+            artifacts/zoanthrope-*.tar.gz.sha256
+            artifacts/SHA256SUMS
+            server.json
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # Publish the npm shim to @spuentesp/zoanthrope via npm Trusted
+  # Publishing (OIDC) — no NPM_TOKEN secret. The job's
+  # `id-token: write` is what makes the OIDC exchange possible.
+  #
+  # One-time owner configuration at
+  # https://www.npmjs.com/package/@spuentesp/zoanthrope/access :
+  #   Provider:           GitHub Actions
+  #   Repository:         spuentesp/zoanthrope
+  #   Workflow filename:  release.yml   (basename only)
+  #   Environment:        (blank)
+  #   Permissions:        npm publish
+  #
+  # Must run AFTER the release assets are uploaded: the postinstall
+  # downloads the binary from this repo's GitHub release.
+  publish-npm:
+    needs: [release]
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '22'
+          registry-url: 'https://registry.npmjs.org'
+      # Node 22's bundled npm predates Trusted Publishing OIDC support
+      # (needs 11.5.1+); without the upgrade npm silently falls back to
+      # a credential-less publish and the registry 404s the PUT — easy
+      # to mistake for a trusted-publisher misconfiguration on npmjs.com.
+      - name: Upgrade npm for Trusted Publishing OIDC support
+        run: npm install -g npm@12.0.2
+      - name: Publish to npm
+        working-directory: npm-shim
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          # Prereleases (v0.1.0-rc1 -> 0.1.0-rc1) publish under the
+          # `next` dist-tag; stables take `latest`.
+          case "$VERSION" in
+            *-*) TAG_FLAG="--tag next" ;;
+            *)   TAG_FLAG="" ;;
+          esac
+          npm publish --provenance --access public $TAG_FLAG
+
+  # workflow_dispatch-only retry for a stuck npm publish against an
+  # already-cut release (binaries and the GitHub Release stay untouched).
+  publish-npm-retry:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Validate tag format
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)?$ ]]; then
+            echo "::error::tag input '$TAG' does not look like a release tag (expected vX.Y.Z or vX.Y.Z-suffix)"
+            exit 1
+          fi
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.tag }}
+      - name: Confirm the GitHub Release for this tag already exists
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release view "${{ inputs.tag }}" --repo "$GITHUB_REPOSITORY" >/dev/null
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '22'
+          registry-url: 'https://registry.npmjs.org'
+      - name: Upgrade npm for Trusted Publishing OIDC support
+        run: npm install -g npm@12.0.2
+      - name: Publish to npm
+        working-directory: npm-shim
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          VERSION="${TAG#v}"
+          case "$VERSION" in
+            *-*) TAG_FLAG="--tag next" ;;
+            *)   TAG_FLAG="" ;;
+          esac
+          npm publish --provenance --access public $TAG_FLAG

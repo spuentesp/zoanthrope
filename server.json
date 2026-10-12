@@ -1,0 +1,31 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.spuentesp/zoanthrope",
+  "title": "zoanthrope",
+  "description": "Coordination relay for agent swarms: file claims, presence, postboard intentions, leases, audit.",
+  "version": "0.1.0",
+  "license": "MIT",
+  "repository": {
+    "url": "https://github.com/spuentesp/zoanthrope",
+    "source": "github"
+  },
+  "packages": [
+    {
+      "registryType": "npm",
+      "registryBaseUrl": "https://registry.npmjs.org",
+      "identifier": "@spuentesp/zoanthrope",
+      "version": "0.1.0",
+      "bin": "zoanthrope",
+      "runtimeHint": "npx",
+      "transport": {
+        "type": "stdio"
+      },
+      "packageArguments": [
+        {
+          "type": "positional",
+          "value": "mcp"
+        }
+      ]
+    }
+  ]
+}
