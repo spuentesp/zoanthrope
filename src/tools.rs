@@ -21,6 +21,10 @@ pub const TOOL_NAMES: &[&str] = &[
     "who_am_i",
     "list_active_agents",
     "register_agent",
+    "post_intention",
+    "list_posts",
+    "update_post",
+    "remove_post",
     "rejoin_agent",
     "get_audit_log",
 ];
@@ -78,7 +82,7 @@ pub fn tool_defs() -> Vec<Value> {
         ),
         def(
             "who_am_i",
-            "Identity and holdings of one agent: kind, last_seen, stale flag, claims.",
+            "Identity and holdings of one agent: kind, last_seen, stale flag, claims, posts.",
             json!({
                 "type": "object",
                 "properties": {
@@ -101,7 +105,7 @@ pub fn tool_defs() -> Vec<Value> {
         def(
             "register_agent",
             "Register this agent (or refresh its presence clock). kind is a free-form label \
-             (e.g. 'claude', 'codex', 'kimi'). claim/release calls also register implicitly.",
+             (e.g. 'claude', 'codex', 'kimi'). claim/release/post calls also register implicitly.",
             json!({
                 "type": "object",
                 "properties": {
@@ -109,6 +113,65 @@ pub fn tool_defs() -> Vec<Value> {
                     "kind": {"type": "string"}
                 },
                 "required": ["name"]
+            }),
+        ),
+        def(
+            "post_intention",
+            "Post a public intention to the postboard: what this agent is about to do. \
+             Returns {ok, post_id, post: {post_id, agent_id, title, files, note, status, \
+             created_at, updated_at}}. New posts are status 'open'. Posts are the swarm's \
+             public intentions — kept readable for humans debugging a swarm.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "agent_id": {"type": "string"},
+                    "title": {"type": "string"},
+                    "files": {"type": "array", "items": {"type": "string"}},
+                    "note": {"type": "string"}
+                },
+                "required": ["agent_id", "title", "note"]
+            }),
+        ),
+        def(
+            "list_posts",
+            "Posts, newest-updated first: {post_id, agent_id, title, files, note, status, \
+             created_at, updated_at}. Filter by agent_id and/or status \
+             (open|taken|done|dropped).",
+            json!({
+                "type": "object",
+                "properties": {
+                    "agent_id": {"type": "string"},
+                    "status": {"type": "string", "enum": ["open", "taken", "done", "dropped"]}
+                }
+            }),
+        ),
+        def(
+            "update_post",
+            "Update a post you own — usually its status: open|taken|done|dropped. \
+             title, note, and files are optional partial updates.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "agent_id": {"type": "string"},
+                    "post_id": {"type": "string"},
+                    "status": {"type": "string", "enum": ["open", "taken", "done", "dropped"]},
+                    "title": {"type": "string"},
+                    "note": {"type": "string"},
+                    "files": {"type": "array", "items": {"type": "string"}}
+                },
+                "required": ["agent_id", "post_id"]
+            }),
+        ),
+        def(
+            "remove_post",
+            "Remove a post you own from the postboard. Unknown ids fail loudly.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "agent_id": {"type": "string"},
+                    "post_id": {"type": "string"}
+                },
+                "required": ["agent_id", "post_id"]
             }),
         ),
         def(
@@ -157,6 +220,10 @@ pub fn call_tool(root: &Path, name: &str, args: &Value) -> Result<Value, String>
         "who_am_i" => who_am_i(root, args),
         "list_active_agents" => list_active_agents(root, args),
         "register_agent" => register_agent(root, args),
+        "post_intention" => post_intention(root, args),
+        "list_posts" => list_posts(root, args),
+        "update_post" => update_post(root, args),
+        "remove_post" => remove_post(root, args),
         "rejoin_agent" => rejoin_agent(root, args),
         "get_audit_log" => get_audit_log(root, args),
         other => Err(format!(
@@ -174,6 +241,14 @@ fn agent_id(args: &Value) -> Result<String, String> {
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .ok_or_else(|| "agent_id is required".to_string())
+}
+
+fn optional_str(args: &Value, key: &str) -> Result<Option<String>, String> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) => Ok(Some(s.clone())),
+        Some(_) => Err(format!("{key} must be a string")),
+    }
 }
 
 fn optional_str_list(args: &Value, key: &str) -> Result<Option<Vec<String>>, String> {
@@ -344,6 +419,117 @@ fn register_agent(root: &Path, args: &Value) -> Result<Value, String> {
             "kind": a.kind,
             "last_seen": a.last_seen,
         }))
+    })
+}
+
+// ─── postboard ──────────────────────────────────────────────────────
+
+fn post_intention(root: &Path, args: &Value) -> Result<Value, String> {
+    let agent = agent_id(args)?;
+    let title = args
+        .get("title")
+        .and_then(Value::as_str)
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| "post_intention: title is required".to_string())?;
+    let note = args
+        .get("note")
+        .and_then(Value::as_str)
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| "post_intention: note is required".to_string())?;
+    let files = optional_str_list(args, "files")?.unwrap_or_default();
+    state::update(root, |s| {
+        let now = state::now_unix();
+        // Implicit registration keeps hooks frictionless.
+        s.register(&agent, "other", now);
+        let p = s.create_post(&agent, &title, files, &note, now);
+        Ok(json!({
+            "ok": true,
+            "post_id": p.post_id,
+            "post": {
+                "post_id": p.post_id,
+                "agent_id": p.agent,
+                "title": p.title,
+                "files": p.files,
+                "note": p.note,
+                "status": p.status,
+                "created_at": p.created_at,
+                "updated_at": p.updated_at,
+            }
+        }))
+    })
+}
+
+fn list_posts(root: &Path, args: &Value) -> Result<Value, String> {
+    let agent = optional_str(args, "agent_id")?.filter(|s| !s.trim().is_empty());
+    let status = match optional_str(args, "status")? {
+        Some(s) if !s.trim().is_empty() => Some(state::normalize_post_status(&s)?),
+        _ => None,
+    };
+    state::read(
+        root,
+        |s| json!({"ok": true, "posts": s.post_views(agent.as_deref(), status.as_deref())}),
+    )
+}
+
+fn update_post(root: &Path, args: &Value) -> Result<Value, String> {
+    let agent = agent_id(args)?;
+    let post_id = args
+        .get("post_id")
+        .and_then(Value::as_str)
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| "update_post: post_id is required".to_string())?;
+    let status = optional_str(args, "status")?;
+    let title = optional_str(args, "title")?;
+    let note = optional_str(args, "note")?;
+    let files = optional_str_list(args, "files")?;
+    if status.is_none() && title.is_none() && note.is_none() && files.is_none() {
+        return Err("update_post: nothing to update (status, title, note, or files)".into());
+    }
+    state::update(root, |s| {
+        let now = state::now_unix();
+        s.register(&agent, "other", now);
+        let p = s.update_post(
+            &agent,
+            &post_id,
+            status.as_deref(),
+            title.as_deref(),
+            note.as_deref(),
+            files,
+            now,
+        )?;
+        Ok(json!({
+            "ok": true,
+            "post_id": p.post_id,
+            "post": {
+                "post_id": p.post_id,
+                "agent_id": p.agent,
+                "title": p.title,
+                "files": p.files,
+                "note": p.note,
+                "status": p.status,
+                "created_at": p.created_at,
+                "updated_at": p.updated_at,
+            }
+        }))
+    })
+}
+
+fn remove_post(root: &Path, args: &Value) -> Result<Value, String> {
+    let agent = agent_id(args)?;
+    let post_id = args
+        .get("post_id")
+        .and_then(Value::as_str)
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| "remove_post: post_id is required".to_string())?;
+    state::update(root, |s| {
+        let now = state::now_unix();
+        s.register(&agent, "other", now);
+        let p = s.remove_post(&agent, &post_id, now)?;
+        Ok(json!({"ok": true, "post_id": p.post_id, "removed": true}))
     })
 }
 
@@ -545,8 +731,11 @@ pub fn status_text(root: &Path) -> String {
         ttl
     ));
     out.push_str(&format!(
-        "board: epoch {} ({} claims, {} agents)\n\n",
-        state.board.epoch, state.board.claims_count, state.board.agents_count
+        "board: epoch {} ({} claims, {} open posts, {} agents)\n\n",
+        state.board.epoch,
+        state.board.claims_count,
+        state.board.open_posts,
+        state.board.agents_count
     ));
 
     out.push_str(&format!("agents ({}):\n", state.agents.len()));
@@ -606,6 +795,22 @@ pub fn status_text(root: &Path) -> String {
     }
     if !any_lease {
         out.push_str("  (none)\n");
+    }
+
+    let posts = state.post_views(None, None);
+    out.push_str(&format!("\npostboard ({}):\n", posts.len()));
+    if posts.is_empty() {
+        out.push_str("  (none)\n");
+    }
+    for p in &posts {
+        out.push_str(&format!(
+            "  [{}] {:<16} {:<8} {}  files={:?}\n",
+            p["post_id"].as_str().unwrap_or("?"),
+            p["agent_id"].as_str().unwrap_or("?"),
+            p["status"].as_str().unwrap_or("?"),
+            p["title"].as_str().unwrap_or("?"),
+            p["files"],
+        ));
     }
 
     out.push_str(&format!(
@@ -804,6 +1009,51 @@ mod tests {
     }
 
     #[test]
+    fn postboard_create_update_list_remove() {
+        let root = temp_root("postboard");
+        let posted = call_tool(
+            &root,
+            "post_intention",
+            &json!({
+                "agent_id": "alpha",
+                "title": "fix the flake",
+                "files": ["a.rs"],
+                "note": "shows up under load"
+            }),
+        )
+        .unwrap();
+        assert_eq!(posted["ok"], true);
+        assert_eq!(posted["post"]["status"], "open");
+        assert_eq!(posted["post"]["title"], "fix the flake");
+        let id = posted["post_id"].as_str().unwrap().to_string();
+
+        let updated = call_tool(
+            &root,
+            "update_post",
+            &json!({"agent_id": "alpha", "post_id": id, "status": "taken"}),
+        )
+        .unwrap();
+        assert_eq!(updated["ok"], true);
+        assert_eq!(updated["post"]["status"], "taken");
+        assert_eq!(updated["post"]["title"], "fix the flake");
+
+        let listed = call_tool(&root, "list_posts", &json!({"status": "taken"})).unwrap();
+        assert_eq!(listed["posts"].as_array().unwrap().len(), 1);
+        let by_agent = call_tool(&root, "list_posts", &json!({"agent_id": "alpha"})).unwrap();
+        assert_eq!(by_agent["posts"].as_array().unwrap().len(), 1);
+
+        let removed = call_tool(
+            &root,
+            "remove_post",
+            &json!({"agent_id": "alpha", "post_id": id}),
+        )
+        .unwrap();
+        assert_eq!(removed["ok"], true);
+        let empty = call_tool(&root, "list_posts", &json!({})).unwrap();
+        assert_eq!(empty["posts"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
     fn who_am_i_and_register_shapes() {
         let root = temp_root("who");
         let reg = call_tool(
@@ -821,6 +1071,7 @@ mod tests {
         assert_eq!(who["name"], "beta");
         assert_eq!(who["stale"], false);
         assert!(who["claims"].as_array().unwrap().is_empty());
+        assert!(who["posts"].as_array().unwrap().is_empty());
 
         let unknown = call_tool(&root, "who_am_i", &json!({"agent_id": "ghost"})).unwrap();
         assert_eq!(unknown["ok"], false);
@@ -837,6 +1088,33 @@ mod tests {
             &json!({"agent_id": "a", "mode": "sideways", "files": ["x"]})
         )
         .is_err());
+        assert!(
+            call_tool(
+                &root,
+                "post_intention",
+                &json!({"agent_id": "a", "note": "n"})
+            )
+            .is_err(),
+            "posting without a title must fail"
+        );
+        assert!(
+            call_tool(
+                &root,
+                "post_intention",
+                &json!({"agent_id": "a", "title": "t"})
+            )
+            .is_err(),
+            "posting without a note must fail"
+        );
+        assert!(
+            call_tool(
+                &root,
+                "update_post",
+                &json!({"agent_id": "a", "post_id": "p1", "status": "cooking"})
+            )
+            .is_err(),
+            "the status set is closed"
+        );
         assert!(
             call_tool(
                 &root,
@@ -857,13 +1135,20 @@ mod tests {
             &json!({"agent_id": "alpha", "files": ["a.rs"]}),
         )
         .unwrap();
+        call_tool(
+            &root,
+            "post_intention",
+            &json!({"agent_id": "alpha", "title": "ship", "note": "n"}),
+        )
+        .unwrap();
         let log = call_tool(&root, "get_audit_log", &json!({"limit": 10})).unwrap();
         assert_eq!(log["ok"], true);
         let events = log["events"].as_array().unwrap();
-        assert!(events.len() >= 2, "register + claim events");
+        assert!(events.len() >= 3, "register + claim + post events");
         assert_eq!(events[0]["action"], "register");
         assert_eq!(events[1]["action"], "claim");
         assert_eq!(events[1]["path"], "a.rs");
+        assert_eq!(events[2]["action"], "post");
     }
 
     #[test]
@@ -901,9 +1186,17 @@ mod tests {
             &json!({"agent_id": "alpha", "files": ["a.rs"], "purpose": "wip"}),
         )
         .unwrap();
+        call_tool(
+            &root,
+            "post_intention",
+            &json!({"agent_id": "alpha", "title": "ship it", "note": "careful"}),
+        )
+        .unwrap();
         let text = status_text(&root);
         assert!(text.contains("alpha"));
         assert!(text.contains("a.rs"));
+        assert!(text.contains("ship it"));
+        assert!(text.contains("postboard ("));
         assert!(text.contains("board: epoch "));
         assert!(text.contains("audit: "));
     }

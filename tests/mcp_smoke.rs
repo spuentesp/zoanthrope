@@ -113,6 +113,10 @@ fn mcp_smoke_initialize_tools_claim_and_conflict() {
         "who_am_i",
         "list_active_agents",
         "register_agent",
+        "post_intention",
+        "list_posts",
+        "update_post",
+        "remove_post",
         "rejoin_agent",
         "get_audit_log",
     ] {
@@ -151,13 +155,48 @@ fn mcp_smoke_initialize_tools_claim_and_conflict() {
     let audit = client.call_tool("get_audit_log", json!({"limit": 50}));
     assert!(audit["events"].as_array().unwrap().len() >= 2);
 
-    // 6. Rejoin keeps the claim and republishes the board.
+    // 6. Postboard round trip: post an intention, find it, move it
+    //    through its statuses, remove it.
+    let posted = client.call_tool(
+        "post_intention",
+        json!({
+            "agent_id": "alpha",
+            "title": "fix the flake",
+            "files": ["a.rs"],
+            "note": "shows up under load"
+        }),
+    );
+    assert_eq!(posted["ok"], true);
+    assert_eq!(posted["post"]["status"], "open");
+    let post_id = posted["post_id"].as_str().unwrap().to_string();
+    let listed = client.call_tool("list_posts", json!({"agent_id": "alpha"}));
+    let posts = listed["posts"].as_array().unwrap();
+    assert_eq!(posts.len(), 1);
+    assert_eq!(posts[0]["post_id"], post_id);
+    assert_eq!(posts[0]["title"], "fix the flake");
+    assert_eq!(posts[0]["note"], "shows up under load");
+    let updated = client.call_tool(
+        "update_post",
+        json!({"agent_id": "alpha", "post_id": post_id, "status": "done"}),
+    );
+    assert_eq!(updated["post"]["status"], "done");
+    let done = client.call_tool("list_posts", json!({"status": "done"}));
+    assert_eq!(done["posts"].as_array().unwrap().len(), 1);
+    let removed = client.call_tool(
+        "remove_post",
+        json!({"agent_id": "alpha", "post_id": post_id}),
+    );
+    assert_eq!(removed["ok"], true);
+    let empty = client.call_tool("list_posts", json!({}));
+    assert_eq!(empty["posts"].as_array().unwrap().len(), 0);
+
+    // 7. Rejoin keeps the claim and republishes the board.
     let rejoined = client.call_tool("rejoin_agent", json!({"agent_id": "alpha"}));
     assert_eq!(rejoined["ok"], true);
     assert_eq!(rejoined["claims_kept"], json!(["a.rs"]));
     assert!(rejoined["view_epoch"].as_u64().unwrap() >= 1);
 
-    // 7. Release frees the file; beta can take it.
+    // 8. Release frees the file; beta can take it.
     let released = client.call_tool(
         "claim_files",
         json!({"agent_id": "alpha", "mode": "release", "files": ["a.rs"]}),

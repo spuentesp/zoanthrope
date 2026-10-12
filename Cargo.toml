@@ -2,7 +2,7 @@
 name = "zoanthrope"
 version = "0.1.0"
 edition = "2021"
-description = "Swarm-coordination MCP server: file claims, agent presence, filesystem leases, audit."
+description = "Swarm-coordination MCP server: file claims, agent presence, postboard intentions, filesystem leases, audit."
 license = "MIT"
 
 [dependencies]

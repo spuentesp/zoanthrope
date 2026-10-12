@@ -1,4 +1,4 @@
-//! Workspace state: claims, agents, the published board, and the
+//! Workspace state: claims, agents, posts, the published board, and the
 //! audit ring. Persisted as `.zoanthrope/state.json` under the workspace
 //! root.
 //!
@@ -27,7 +27,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 /// State file format version. Bump on incompatible on-disk changes.
-/// Version 2: claims carry an intent, the
+/// Version 2: claims carry an intent, posts replace intents, the
 /// published board section was added.
 pub const STATE_VERSION: u32 = 2;
 
@@ -151,6 +151,38 @@ pub struct AgentInfo {
     pub last_seen: f64,
 }
 
+/// A postboard entry: one agent's public intention. The shape is meant
+/// to be readable by a human debugging a swarm.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Post {
+    pub post_id: String,
+    pub agent: String,
+    pub title: String,
+    #[serde(default)]
+    pub files: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    /// `open` | `taken` | `done` | `dropped`.
+    pub status: String,
+    pub created_at: f64,
+    pub updated_at: f64,
+}
+
+/// The closed post status set (`open` → `taken` → `done`, or `dropped`).
+pub const POST_STATUSES: [&str; 4] = ["open", "taken", "done", "dropped"];
+
+pub fn normalize_post_status(raw: &str) -> Result<String, String> {
+    let s = raw.trim().to_ascii_lowercase();
+    if POST_STATUSES.contains(&s.as_str()) {
+        Ok(s)
+    } else {
+        Err(format!(
+            "status must be one of {} (got '{raw}')",
+            POST_STATUSES.join("|")
+        ))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AuditEvent {
     pub ts: f64,
@@ -214,6 +246,8 @@ pub struct Board {
     pub epoch: u64,
     pub by_path: Vec<BoardHolding>,
     pub claims_count: usize,
+    pub open_posts: usize,
+    pub posts_count: usize,
     pub agents_count: usize,
 }
 
@@ -289,7 +323,13 @@ pub struct State {
     pub version: u32,
     pub claims: Vec<Claim>,
     pub agents: Vec<AgentInfo>,
+    pub posts: Vec<Post>,
     pub audit: VecDeque<AuditEvent>,
+    /// Monotone post-id counter. Ids are never recycled, so an update
+    /// against a removed post fails loudly instead of hitting a newer
+    /// post that happens to reuse the id.
+    #[serde(default)]
+    pub post_seq: u64,
     /// The published board (derived view + its generation).
     #[serde(default)]
     pub board: Board,
@@ -301,7 +341,9 @@ impl Default for State {
             version: STATE_VERSION,
             claims: Vec::new(),
             agents: Vec::new(),
+            posts: Vec::new(),
             audit: VecDeque::new(),
+            post_seq: 0,
             board: Board::default(),
         }
     }
@@ -522,7 +564,7 @@ impl State {
             .collect()
     }
 
-    /// One agent's view: identity and claims.
+    /// One agent's view: identity, claims, and current posts.
     pub fn who(&self, agent: &str, now: f64, ttl: u64) -> Option<Value> {
         let a = self.agents.iter().find(|a| a.name == agent)?;
         Some(json!({
@@ -531,8 +573,130 @@ impl State {
             "kind": a.kind,
             "last_seen": a.last_seen,
             "stale": is_stale(a.last_seen, now, ttl),
-            "claims": self.claim_views(Some(agent), now, ttl)
+            "claims": self.claim_views(Some(agent), now, ttl),
+            "posts": self.post_views(Some(agent), None),
         }))
+    }
+
+    // ─── postboard ──────────────────────────────────────────────────
+
+    /// Post a public intention. Posts do not replace each other — an
+    /// agent may have several live at once.
+    pub fn create_post(
+        &mut self,
+        agent: &str,
+        title: &str,
+        files: Vec<String>,
+        note: &str,
+        now: f64,
+    ) -> Post {
+        self.post_seq += 1;
+        let post = Post {
+            post_id: format!("p{}", self.post_seq),
+            agent: agent.to_string(),
+            title: title.to_string(),
+            files: files.into_iter().map(|f| posix(&f)).collect(),
+            note: Some(note.to_string()),
+            status: "open".to_string(),
+            created_at: now,
+            updated_at: now,
+        };
+        self.posts.push(post.clone());
+        self.push_audit(AuditEvent {
+            ts: now,
+            agent: agent.to_string(),
+            action: "post".to_string(),
+            path: None,
+            purpose: Some(title.to_string()),
+        });
+        self.touch(agent, now);
+        post
+    }
+
+    /// Partially update a post owned by `agent` (status is the usual
+    /// reason to call). Unknown ids and foreign posts fail loudly.
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_post(
+        &mut self,
+        agent: &str,
+        post_id: &str,
+        status: Option<&str>,
+        title: Option<&str>,
+        note: Option<&str>,
+        files: Option<Vec<String>>,
+        now: f64,
+    ) -> Result<Post, String> {
+        let idx = self
+            .posts
+            .iter()
+            .position(|p| p.post_id == post_id)
+            .ok_or_else(|| format!("unknown post_id '{post_id}'"))?;
+        if self.posts[idx].agent != agent {
+            return Err(format!("post '{post_id}' is not owned by '{agent}'"));
+        }
+        let post = &mut self.posts[idx];
+        if let Some(s) = status {
+            post.status = normalize_post_status(s)?;
+        }
+        if let Some(t) = title {
+            post.title = t.to_string();
+        }
+        if let Some(n) = note {
+            post.note = Some(n.to_string());
+        }
+        if let Some(f) = files {
+            post.files = f.into_iter().map(|x| posix(&x)).collect();
+        }
+        post.updated_at = now;
+        let post = post.clone();
+        self.push_audit(AuditEvent {
+            ts: now,
+            agent: agent.to_string(),
+            action: "post_update".to_string(),
+            path: None,
+            purpose: Some(format!("{}: {}", post.post_id, post.status)),
+        });
+        self.touch(agent, now);
+        Ok(post)
+    }
+
+    /// Remove a post owned by `agent`.
+    pub fn remove_post(&mut self, agent: &str, post_id: &str, now: f64) -> Result<Post, String> {
+        let idx = self
+            .posts
+            .iter()
+            .position(|p| p.post_id == post_id)
+            .ok_or_else(|| format!("unknown post_id '{post_id}'"))?;
+        if self.posts[idx].agent != agent {
+            return Err(format!("post '{post_id}' is not owned by '{agent}'"));
+        }
+        let post = self.posts.remove(idx);
+        self.push_audit(AuditEvent {
+            ts: now,
+            agent: agent.to_string(),
+            action: "post_remove".to_string(),
+            path: None,
+            purpose: Some(post.post_id.clone()),
+        });
+        self.touch(agent, now);
+        Ok(post)
+    }
+
+    /// Posts, newest-updated first. Filter by agent and/or status.
+    pub fn post_views(&self, agent: Option<&str>, status: Option<&str>) -> Vec<Value> {
+        let mut posts: Vec<&Post> = self
+            .posts
+            .iter()
+            .filter(|p| agent.is_none_or(|a| p.agent == a))
+            .filter(|p| status.is_none_or(|s| p.status == s))
+            .collect();
+        posts.sort_by(|a, b| {
+            b.updated_at
+                .partial_cmp(&a.updated_at)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| b.post_id.cmp(&a.post_id))
+        });
+        posts.iter().map(|p| post_json(p)).collect()
     }
 
     // ─── board + rejoin protocol ────────────────────────────────────
@@ -553,6 +717,8 @@ impl State {
             epoch: self.board.epoch,
             by_path,
             claims_count: self.claims.len(),
+            open_posts: self.posts.iter().filter(|p| p.status == "open").count(),
+            posts_count: self.posts.len(),
             agents_count: self.agents.len(),
         }
     }
@@ -633,6 +799,19 @@ impl State {
     }
 }
 
+fn post_json(p: &Post) -> Value {
+    json!({
+        "post_id": p.post_id,
+        "agent_id": p.agent,
+        "title": p.title,
+        "files": p.files,
+        "note": p.note,
+        "status": p.status,
+        "created_at": p.created_at,
+        "updated_at": p.updated_at,
+    })
+}
+
 pub fn board_json(b: &Board) -> Value {
     json!({
         "epoch": b.epoch,
@@ -642,6 +821,8 @@ pub fn board_json(b: &Board) -> Value {
             "intent": h.intent.as_str(),
         })).collect::<Vec<_>>(),
         "claims_count": b.claims_count,
+        "open_posts": b.open_posts,
+        "posts_count": b.posts_count,
         "agents_count": b.agents_count,
     })
 }
@@ -1072,11 +1253,13 @@ mod tests {
             now,
             900,
         );
+        s.create_post("alpha", "ship it", vec!["src/".into()], "careful", now);
         s.publish_board();
         save(&root, &s).unwrap();
         let loaded = load(&root).unwrap();
         assert_eq!(loaded.claims, s.claims);
         assert_eq!(loaded.agents, s.agents);
+        assert_eq!(loaded.posts, s.posts);
         assert_eq!(loaded.audit, s.audit);
         assert_eq!(loaded.board, s.board);
         assert_eq!(loaded.version, STATE_VERSION);
@@ -1261,6 +1444,84 @@ mod tests {
             ClaimIntent::Edit.strongest(ClaimIntent::Read),
             ClaimIntent::Edit
         );
+    }
+
+    // ─── postboard ──────────────────────────────────────────────────
+
+    #[test]
+    fn posts_create_update_remove() {
+        let mut s = State::default();
+        let now = 1_000.0;
+        s.register("alpha", "claude", now);
+        let p = s.create_post(
+            "alpha",
+            "fix the flake",
+            vec!["a.rs".into()],
+            "under load",
+            now,
+        );
+        assert_eq!(p.post_id, "p1");
+        assert_eq!(p.status, "open");
+        assert_eq!(p.files, vec!["a.rs".to_string()]);
+
+        let upd = s
+            .update_post("alpha", "p1", Some("taken"), None, None, None, now + 1.0)
+            .unwrap();
+        assert_eq!(upd.status, "taken");
+        assert_eq!(upd.title, "fix the flake", "untouched fields stay");
+        assert_eq!(upd.updated_at, now + 1.0);
+
+        // The status set is closed.
+        assert!(s
+            .update_post("alpha", "p1", Some("cooking"), None, None, None, now)
+            .is_err());
+
+        // Foreign posts and unknown ids fail loudly.
+        s.register("beta", "codex", now);
+        assert!(s
+            .update_post("beta", "p1", Some("done"), None, None, None, now)
+            .is_err());
+        assert!(s
+            .update_post("alpha", "p99", Some("done"), None, None, None, now)
+            .is_err());
+
+        let removed = s.remove_post("alpha", "p1", now + 2.0).unwrap();
+        assert_eq!(removed.post_id, "p1");
+        assert!(s.posts.is_empty());
+        // Ids are never recycled.
+        let p2 = s.create_post("alpha", "next", vec![], "n", now + 3.0);
+        assert_eq!(p2.post_id, "p2");
+    }
+
+    #[test]
+    fn post_views_filter_by_agent_and_status() {
+        let mut s = State::default();
+        let now = 1_000.0;
+        s.register("alpha", "claude", now);
+        s.register("beta", "codex", now);
+        s.create_post("alpha", "one", vec![], "n", now);
+        s.create_post("beta", "two", vec![], "n", now + 1.0);
+        s.update_post("alpha", "p1", Some("done"), None, None, None, now + 2.0)
+            .unwrap();
+
+        assert_eq!(s.post_views(None, None).len(), 2);
+        assert_eq!(s.post_views(Some("alpha"), None).len(), 1);
+        let open = s.post_views(None, Some("open"));
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0]["title"], "two");
+        // Newest-updated first.
+        assert_eq!(s.post_views(None, None)[0]["post_id"], "p1");
+    }
+
+    #[test]
+    fn who_carries_posts() {
+        let mut s = State::default();
+        let now = 1_000.0;
+        s.register("alpha", "claude", now);
+        s.create_post("alpha", "ship it", vec![], "note text", now);
+        let who = s.who("alpha", now, 900).unwrap();
+        assert_eq!(who["posts"][0]["title"], "ship it");
+        assert_eq!(who["posts"][0]["note"], "note text");
     }
 
     // ─── rejoin protocol ────────────────────────────────────────────
