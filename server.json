@@ -3,7 +3,7 @@
   "name": "io.github.spuentesp/zoanthrope",
   "title": "zoanthrope",
   "description": "Coordination relay for agent swarms: file claims, presence, postboard intentions, leases, audit.",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "license": "MIT",
   "repository": {
     "url": "https://github.com/spuentesp/zoanthrope",
@@ -14,7 +14,7 @@
       "registryType": "npm",
       "registryBaseUrl": "https://registry.npmjs.org",
       "identifier": "@spuentesp/zoanthrope",
-      "version": "0.1.1",
+      "version": "0.1.2",
       "bin": "zoanthrope",
       "runtimeHint": "npx",
       "transport": {

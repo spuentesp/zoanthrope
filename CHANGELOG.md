@@ -3,6 +3,12 @@
 All notable changes to zoanthrope. Versions follow `vX.Y.Z` git tags
 (see `docs/RELEASING.md`).
 
+## 0.1.2 — 2026-10-12
+
+- File identity: one canonical claim key — absolute/relative/`..` spellings of the same file now resolve to a single claim (a lock whose key can duplicate is a broken lock).
+- Claims bind content: a `ContentStamp` (mtime+size, sha256 for small files) is recorded at claim time; guarded writes against a changed file are denied as `stale-claim` — re-read, re-claim. Preventive locking now also prevents stale overwrites, not just concurrent ones.
+- Watcher attribution requires the claim to precede the mutation (post-hoc claims no longer silence `unclaimed-mutation`); default watch set is the git-tracked file list.
+
 ## 0.1.1 — 2026-10-12
 
 - npm shim: `bin` entry repaired (npm requires `./`-prefixed bin paths; 0.1.0 shipped without the `zoanthrope` command linked). 0.1.1 supersedes it.
