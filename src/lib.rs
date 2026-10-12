@@ -5,6 +5,7 @@
 //! harnesses (`tests/clobber_chaos.rs`, `src/bin/zoo-bench.rs`) drive
 //! the same [`tools::call_tool`] surface the MCP server serves.
 
+pub mod bash_parse;
 pub mod fs_lease;
 pub mod mcp;
 pub mod state;
