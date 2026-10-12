@@ -1,0 +1,146 @@
+name: CI
+
+# Single-lane CI on `main` and PRs:
+#
+#   lint        cargo fmt --check + clippy --all-targets -D warnings
+#   test        cargo test (the full suite)
+#   tlc         formal gate: every spec in formal/MANIFEST via TLC
+#               (REQUIRED check — see docs/RELEASING.md)
+#   chaos-smoke fast clobber-chaos smoke (2x8, claim + stomp)
+#   chaos-full  the heavyweight chaos run, workflow_dispatch only
+#               (knobs: workers / iters / mode)
+#
+# `concurrency:` cancels superseded runs so rapid-fire commits don't
+# pile up behind each other. `github.head_ref` is only set for
+# pull_request events; the `|| github.ref` fallback gives push events
+# their own per-ref group instead of colliding on an empty string.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      workers:
+        description: 'Chaos workers (ZOO_CHAOS_WORKERS)'
+        required: false
+        default: '16'
+        type: string
+      iters:
+        description: 'Iterations per worker (ZOO_CHAOS_ITERS)'
+        required: false
+        default: '200'
+        type: string
+      mode:
+        description: 'Chaos mode (ZOO_CHAOS_MODE): claim or stomp'
+        required: false
+        default: 'claim'
+        type: choice
+        options:
+          - claim
+          - stomp
+
+concurrency:
+  group: ci-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # TLA+ tools jar for the TLC formal gate. Deliberately NOT vendored
+  # in the repo (4.5 MB binary blob): the CI job downloads the official
+  # v1.8.0 release and pins it by SHA256 — a mismatch fails the job.
+  # Local runs: `TLA2TOOLS_JAR=/path/to/tla2tools.jar ./check.sh`.
+  TLA2TOOLS_VERSION: '1.8.0'
+  TLA2TOOLS_SHA256: '7beec0f04818732a62fa193731711a99aa4f11279499b2360a7d156c519ea78d'
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Format & clippy
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --all-targets -- -D warnings
+
+  test:
+    name: Cargo test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - run: cargo test
+
+  # The formal gate. `formal/check.sh` runs every spec in
+  # formal/MANIFEST through TLC and requires each outcome to match its
+  # `expect` column (clean proofs for `pass` rows, documented
+  # counterexamples for `fail` rows). Mark this check REQUIRED in
+  # branch protection (docs/RELEASING.md).
+  tlc:
+    name: TLC formal specs
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # check.sh invokes `java -jar tla2tools.jar` — a JRE is enough.
+      - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
+        with:
+          distribution: temurin
+          java-version: '17'
+          java-package: jre
+      - name: Fetch tla2tools.jar (pinned by SHA256)
+        run: |
+          set -euo pipefail
+          curl -fsSL -o "$RUNNER_TEMP/tla2tools.jar" \
+            "https://github.com/tlaplus/tlaplus/releases/download/v${TLA2TOOLS_VERSION}/tla2tools.jar"
+          echo "${TLA2TOOLS_SHA256}  $RUNNER_TEMP/tla2tools.jar" | sha256sum -c -
+      - name: Run TLC over formal/MANIFEST
+        run: cd formal && TLA2TOOLS_JAR="$RUNNER_TEMP/tla2tools.jar" ./check.sh
+
+  # The fast harness lane: 2 workers x 8 iters, both modes (claim and
+  # the stomp positive control). Runs in seconds; the heavyweight
+  # chaos-full job below is dispatch-only.
+  chaos-smoke:
+    name: Clobber chaos smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - name: clobber_chaos_smoke (2x8, both modes)
+        run: cargo test --test clobber_chaos clobber_chaos_smoke -- --nocapture
+
+  # Full chaos run (default 16 workers x 200 iters x 50 files), manual
+  # only. Knobs mirror the harness env vars (tests/clobber_chaos.rs):
+  # ZOO_CHAOS_WORKERS / ZOO_CHAOS_ITERS / ZOO_CHAOS_MODE.
+  chaos-full:
+    name: Clobber chaos (full, manual)
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - name: Full clobber chaos
+        env:
+          ZOO_CHAOS_WORKERS: ${{ inputs.workers || '16' }}
+          ZOO_CHAOS_ITERS: ${{ inputs.iters || '200' }}
+          ZOO_CHAOS_MODE: ${{ inputs.mode || 'claim' }}
+        run: cargo test --release --test clobber_chaos -- --ignored --nocapture
