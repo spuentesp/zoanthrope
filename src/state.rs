@@ -276,6 +276,18 @@ impl ContentStamp {
     }
 }
 
+/// A caller-supplied stamp: an opaque `{name, value}` pair the *caller*
+/// computed (e.g. `symbol:parse_token` → a sha256 hex). zoanthrope
+/// stores and returns caller stamps verbatim; it never computes,
+/// interprets, or verifies them. Verification is the caller's business
+/// — the file-level [`ContentStamp`] is the only stamp zoanthrope
+/// re-checks itself.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CallerStamp {
+    pub name: String,
+    pub value: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Claim {
     pub path: String,
@@ -289,6 +301,10 @@ pub struct Claim {
     /// claim recorded before fingerprinting existed — never checked.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fingerprint: Option<ContentStamp>,
+    /// Opaque caller-supplied stamps recorded with the claim. Absent on
+    /// pre-0.1.3 states (serde-defaults to empty). Never verified.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub caller_stamps: Vec<CallerStamp>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -339,6 +355,10 @@ pub struct AuditEvent {
     pub path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub purpose: Option<String>,
+    /// Stamp *names* recorded on a claim event — never values.
+    /// Absent on pre-0.1.3 audit lines.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stamps: Option<Vec<String>>,
 }
 
 /// The conflict response — the heart of the product. A claim that
@@ -353,6 +373,9 @@ pub struct Conflict {
     pub holder_stale: bool,
     /// The holder's recorded (strongest) intent on `path`.
     pub intent: ClaimIntent,
+    /// The holder's opaque caller stamps — a waiting agent sees what
+    /// the holder pinned. Stored, never verified by zoanthrope.
+    pub caller_stamps: Vec<CallerStamp>,
 }
 
 impl Conflict {
@@ -365,6 +388,7 @@ impl Conflict {
             "purpose": self.purpose,
             "holder_stale": self.holder_stale,
             "intent": self.intent.as_str(),
+            "caller_stamps": self.caller_stamps,
         })
     }
 }
@@ -520,6 +544,7 @@ impl State {
                     action: "register".to_string(),
                     path: None,
                     purpose: Some(kind.to_string()),
+                    stamps: None,
                 });
                 a
             }
@@ -565,6 +590,7 @@ impl State {
                         purpose: c.purpose.clone(),
                         holder_stale,
                         intent: c.intent,
+                        caller_stamps: c.caller_stamps.clone(),
                     });
                 }
             }
@@ -576,10 +602,15 @@ impl State {
     /// A re-claim of the agent's own path refreshes `claimed_at` and
     /// `purpose` and keeps the *strongest* intent (a later weaker claim
     /// never hides a stronger one — `PresenceClaims_LastWins.cfg`).
+    /// `stamps` is the batch's caller-stamp set: `Some(set)` replaces
+    /// the stored set wholesale (never merges), `None` leaves whatever
+    /// the caller pinned earlier in place. Audit lines carry the stamp
+    /// names, never the values.
     pub fn apply_claim(
         &mut self,
         agent: &str,
         files: &[(String, ClaimIntent, Option<String>)],
+        stamps: Option<&[CallerStamp]>,
         now: f64,
     ) -> Vec<Claim> {
         let mut granted = Vec::new();
@@ -594,6 +625,9 @@ impl State {
                     c.intent = c.intent.strongest(*intent);
                     c.claimed_at = now;
                     c.purpose = purpose.clone();
+                    if let Some(set) = stamps {
+                        c.caller_stamps = set.to_vec();
+                    }
                     granted.push(c.clone());
                 }
                 None => {
@@ -604,33 +638,55 @@ impl State {
                         claimed_at: now,
                         purpose: purpose.clone(),
                         fingerprint: None,
+                        caller_stamps: stamps.map(<[CallerStamp]>::to_vec).unwrap_or_default(),
                     };
                     self.claims.push(c.clone());
                     granted.push(c);
                 }
             }
+            let names: Vec<String> = granted
+                .last()
+                .map(|c| c.caller_stamps.iter().map(|s| s.name.clone()).collect())
+                .unwrap_or_default();
             self.push_audit(AuditEvent {
                 ts: now,
                 agent: agent.to_string(),
                 action: "claim".to_string(),
                 path: Some(path),
                 purpose: purpose.clone(),
+                stamps: (!names.is_empty()).then_some(names),
             });
         }
         self.touch(agent, now);
         granted
     }
 
-    /// Claim files for `agent` (all-or-nothing). `files` is
-    /// `(path, purpose)` in request order; `intent` is the claim kind
-    /// for the whole batch. Arbitration then application — one call
-    /// for the pure-registry tests; the tool layer wraps it with the
-    /// filesystem lease step in between.
+    /// Claim files for `agent` (all-or-nothing), without caller stamps.
+    /// See [`Self::claim_with_stamps`].
     pub fn claim(
         &mut self,
         agent: &str,
         files: &[(String, Option<String>)],
         intent: ClaimIntent,
+        now: f64,
+        ttl: u64,
+    ) -> ClaimOutcome {
+        self.claim_with_stamps(agent, files, intent, None, now, ttl)
+    }
+
+    /// [`Self::claim`] with the batch's caller stamps. `files` is
+    /// `(path, purpose)` in request order; `intent` is the claim kind
+    /// for the whole batch; `stamps` is the opaque caller-pin set for
+    /// every file in the batch — `Some(set)` records it (replacing any
+    /// previous set wholesale), `None` leaves an existing set alone.
+    /// Arbitration then application — the tool layer wraps it with the
+    /// filesystem lease step in between.
+    pub fn claim_with_stamps(
+        &mut self,
+        agent: &str,
+        files: &[(String, Option<String>)],
+        intent: ClaimIntent,
+        stamps: Option<&[CallerStamp]>,
         now: f64,
         ttl: u64,
     ) -> ClaimOutcome {
@@ -643,7 +699,7 @@ impl State {
             .iter()
             .map(|(p, purpose)| (p.clone(), intent, purpose.clone()))
             .collect();
-        ClaimOutcome::Granted(self.apply_claim(agent, &batch, now))
+        ClaimOutcome::Granted(self.apply_claim(agent, &batch, stamps, now))
     }
 
     /// Release files held by `agent`. Returns the paths actually
@@ -663,6 +719,7 @@ impl State {
                     action: "release".to_string(),
                     path: Some(path),
                     purpose: None,
+                    stamps: None,
                 });
             }
         }
@@ -689,6 +746,7 @@ impl State {
                     "claimed_at": c.claimed_at,
                     "purpose": c.purpose,
                     "held_by_stale": held_by_stale,
+                    "caller_stamps": c.caller_stamps,
                 })
             })
             .collect()
@@ -756,6 +814,7 @@ impl State {
             action: "post".to_string(),
             path: None,
             purpose: Some(title.to_string()),
+            stamps: None,
         });
         self.touch(agent, now);
         post
@@ -803,6 +862,7 @@ impl State {
             action: "post_update".to_string(),
             path: None,
             purpose: Some(format!("{}: {}", post.post_id, post.status)),
+            stamps: None,
         });
         self.touch(agent, now);
         Ok(post)
@@ -825,6 +885,7 @@ impl State {
             action: "post_remove".to_string(),
             path: None,
             purpose: Some(post.post_id.clone()),
+            stamps: None,
         });
         self.touch(agent, now);
         Ok(post)
@@ -919,6 +980,7 @@ impl State {
             action: "rejoin".to_string(),
             path: None,
             purpose: None,
+            stamps: None,
         });
         scope
     }
@@ -976,13 +1038,18 @@ pub fn board_json(b: &Board) -> Value {
 }
 
 fn audit_json(e: &AuditEvent) -> Value {
-    json!({
+    let mut v = json!({
         "ts": e.ts,
         "agent": e.agent,
         "action": e.action,
         "path": e.path,
         "purpose": e.purpose,
-    })
+    });
+    // Claim events carry the stamp *names* — values never reach the audit.
+    if let Some(names) = &e.stamps {
+        v["stamps"] = json!(names);
+    }
+    v
 }
 
 // ─── persistence ────────────────────────────────────────────────────
@@ -1185,7 +1252,12 @@ mod tests {
         assert_eq!(v["purpose"], "fix bug");
         assert_eq!(v["holder_stale"], false);
         assert_eq!(v["intent"], "edit");
-        assert_eq!(v.as_object().unwrap().len(), 7);
+        assert_eq!(
+            v["caller_stamps"],
+            json!([]),
+            "shape key, empty when unpinned"
+        );
+        assert_eq!(v.as_object().unwrap().len(), 8);
 
         // Nothing was granted to beta.
         assert_eq!(s.claims.len(), 1);
@@ -1368,6 +1440,7 @@ mod tests {
                 action: "claim".into(),
                 path: Some(format!("f{i}.rs")),
                 purpose: None,
+                stamps: None,
             });
         }
         assert_eq!(s.audit.len(), AUDIT_CAP);
@@ -1939,6 +2012,191 @@ mod tests {
             .remove("fingerprint");
         let legacy: State = serde_json::from_value(v).unwrap();
         assert!(legacy.claims[0].fingerprint.is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ─── caller stamps ──────────────────────────────────────────────
+
+    #[test]
+    fn caller_stamps_flow_into_views_and_conflicts() {
+        let mut s = State::default();
+        let now = 1_000.0;
+        s.register("alpha", "claude", now);
+        s.register("beta", "codex", now);
+        let pins = vec![
+            CallerStamp {
+                name: "symbol:parse_token".into(),
+                value: "deadbeef".into(),
+            },
+            CallerStamp {
+                name: "graph:ast".into(),
+                value: "cafe".into(),
+            },
+        ];
+        let out = s.claim_with_stamps(
+            "alpha",
+            &[("a.rs".into(), None)],
+            ClaimIntent::Edit,
+            Some(&pins),
+            now,
+            900,
+        );
+        let granted = match out {
+            ClaimOutcome::Granted(g) => g,
+            ClaimOutcome::Conflict(_) => panic!("expected grant"),
+        };
+        assert_eq!(granted[0].caller_stamps, pins);
+
+        // list/who hand the pins back — the caller verifies its own drift.
+        let views = s.claim_views(None, now, 900);
+        assert_eq!(
+            views[0]["caller_stamps"],
+            json!([
+                {"name": "symbol:parse_token", "value": "deadbeef"},
+                {"name": "graph:ast", "value": "cafe"},
+            ])
+        );
+        let who = s.who("alpha", now, 900).unwrap();
+        assert_eq!(
+            who["claims"][0]["caller_stamps"][0]["name"],
+            "symbol:parse_token"
+        );
+
+        // A waiting agent sees exactly what the holder pinned.
+        match s.claim(
+            "beta",
+            &[("a.rs".into(), None)],
+            ClaimIntent::Edit,
+            now + 1.0,
+            900,
+        ) {
+            ClaimOutcome::Conflict(c) => {
+                assert_eq!(c.caller_stamps, pins);
+                assert_eq!(
+                    c.to_json()["caller_stamps"],
+                    json!([
+                        {"name": "symbol:parse_token", "value": "deadbeef"},
+                        {"name": "graph:ast", "value": "cafe"},
+                    ])
+                );
+            }
+            ClaimOutcome::Granted(_) => panic!("expected conflict"),
+        }
+    }
+
+    #[test]
+    fn reclaim_replaces_the_caller_stamp_set() {
+        let mut s = State::default();
+        let now = 1_000.0;
+        s.register("alpha", "claude", now);
+        let old = vec![CallerStamp {
+            name: "a".into(),
+            value: "1".into(),
+        }];
+        s.claim_with_stamps(
+            "alpha",
+            &[("f.txt".into(), None)],
+            ClaimIntent::Edit,
+            Some(&old),
+            now,
+            900,
+        );
+        let new = vec![CallerStamp {
+            name: "b".into(),
+            value: "2".into(),
+        }];
+        s.claim_with_stamps(
+            "alpha",
+            &[("f.txt".into(), None)],
+            ClaimIntent::Edit,
+            Some(&new),
+            now + 1.0,
+            900,
+        );
+        assert_eq!(
+            s.claims[0].caller_stamps, new,
+            "re-claim with a new set replaces — old gone, new present"
+        );
+        // A re-claim without stamps (the hook / stale-recovery path)
+        // carries the pinned set over instead of wiping it.
+        s.claim_with_stamps(
+            "alpha",
+            &[("f.txt".into(), None)],
+            ClaimIntent::Edit,
+            None,
+            now + 2.0,
+            900,
+        );
+        assert_eq!(s.claims[0].caller_stamps, new, "omitted stamps carry over");
+        // Release drops the claim — and its stamps with it.
+        s.release("alpha", &["f.txt".into()], now + 3.0);
+        assert!(s.claims.is_empty());
+    }
+
+    #[test]
+    fn claim_audit_records_stamp_names_never_values() {
+        let mut s = State::default();
+        s.register("alpha", "claude", 1_000.0);
+        s.claim_with_stamps(
+            "alpha",
+            &[("f.txt".into(), None)],
+            ClaimIntent::Edit,
+            Some(&[CallerStamp {
+                name: "symbol:parse_token".into(),
+                value: "deadbeef".into(),
+            }]),
+            1_000.0,
+            900,
+        );
+        let events = s.audit_events(10, None);
+        let claim_ev = events
+            .iter()
+            .find(|e| e["action"] == "claim")
+            .expect("claim event");
+        assert_eq!(claim_ev["stamps"], json!(["symbol:parse_token"]));
+        assert!(
+            !claim_ev.to_string().contains("deadbeef"),
+            "values never reach the audit"
+        );
+    }
+
+    #[test]
+    fn legacy_state_without_caller_stamps_loads_clean() {
+        let root = temp_root("legacy-stamps");
+        let mut s = State::default();
+        s.register("alpha", "claude", 1_000.0);
+        s.claim_with_stamps(
+            "alpha",
+            &[("a.rs".into(), None)],
+            ClaimIntent::Edit,
+            Some(&[CallerStamp {
+                name: "n".into(),
+                value: "v".into(),
+            }]),
+            1_000.0,
+            900,
+        );
+        save(&root, &s).unwrap();
+
+        // Strip the newer fields: a pre-stamp state.json.
+        let raw = std::fs::read_to_string(state_path(&root)).unwrap();
+        let mut v: Value = serde_json::from_str(&raw).unwrap();
+        for c in v["claims"].as_array_mut().unwrap() {
+            c.as_object_mut().unwrap().remove("caller_stamps");
+        }
+        for e in v["audit"].as_array_mut().unwrap() {
+            e.as_object_mut().unwrap().remove("stamps");
+        }
+        std::fs::write(state_path(&root), serde_json::to_string_pretty(&v).unwrap()).unwrap();
+
+        let loaded = load(&root).unwrap();
+        assert_eq!(loaded.version, STATE_VERSION);
+        assert!(
+            loaded.claims[0].caller_stamps.is_empty(),
+            "old states load with no stamps"
+        );
+        let views = loaded.claim_views(None, 1_000.0, 900);
+        assert_eq!(views[0]["caller_stamps"], json!([]));
         let _ = std::fs::remove_dir_all(&root);
     }
 }

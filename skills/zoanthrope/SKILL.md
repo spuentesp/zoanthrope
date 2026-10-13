@@ -10,14 +10,16 @@ Read state; do not change it unless asked. State lives at
   (`path agent [intent] purpose`), the lease layer, the postboard,
   board epoch.
 - `list_claims` (MCP) — every claim: `{path, agent, intent, claimed_at,
-  purpose, held_by_stale}`. `who_am_i` — one agent's claims + posts.
+  purpose, held_by_stale, caller_stamps}`. `who_am_i` — one agent's
+  claims + posts.
 - `list_active_agents` — everyone, with `stale` flags. Stale agents are
   listed, never dropped.
 
 Claim semantics in one line: `edit` excludes everyone on the path,
 `read` co-holds with `read` but not with `edit`, and an agent's
 recorded intent is the strongest it holds (a later weaker claim never
-downgrades it).
+downgrades it). Claims may carry `caller_stamps` — opaque caller pins
+returned by `list_claims`/`who_am_i` so the caller can verify them.
 
 ## The postboard
 

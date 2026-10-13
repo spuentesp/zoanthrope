@@ -27,8 +27,8 @@ All tools take and return JSON objects. Success bodies carry
 
 | Tool | Arguments | Returns |
 |---|---|---|
-| `claim_files` | `agent_id`, `mode` (`claim` \| `release` \| `list`, default `claim`), `files` (paths or `{path, purpose?}`), `purpose?`, `intent?` (`edit` default \| `read`) | claim: `{ok, granted: [{path, claimed_at, purpose, intent}]}` or the conflict shape; release: `{ok, released: [path]}`; list: `{ok, claims}` |
-| `list_claims` | `agent_id?` | `{ok, claims: [{path, agent, intent, claimed_at, purpose, held_by_stale}]}` |
+| `claim_files` | `agent_id`, `mode` (`claim` \| `release` \| `list`, default `claim`), `files` (paths or `{path, purpose?}`), `purpose?`, `intent?` (`edit` default \| `read`), `stamps?` (array of `{name, value}` caller pins) | claim: `{ok, granted: [{path, claimed_at, purpose, intent, caller_stamps}]}` or the conflict shape; release: `{ok, released: [path]}`; list: `{ok, claims}` |
+| `list_claims` | `agent_id?` | `{ok, claims: [{path, agent, intent, claimed_at, purpose, held_by_stale, caller_stamps}]}` |
 | `who_am_i` | `agent_id` | `{ok, agent_id, name, kind, last_seen, stale, claims, posts}` |
 | `list_active_agents` | `include_stale?` | `{ok, agents: [{agent_id, name, kind, last_seen, stale, claims_count}]}` |
 | `register_agent` | `name`, `kind?` | `{ok, agent_id, name, kind, last_seen}` |
@@ -46,7 +46,7 @@ recorded intent is refused *all-or-nothing* and says exactly who is in
 the way:
 
 ```json
-{"ok": false, "holder": "beta", "path": "a.rs", "claimed_at": 1791780567.1, "purpose": "fix the parser", "holder_stale": false, "intent": "edit"}
+{"ok": false, "holder": "beta", "path": "a.rs", "claimed_at": 1791780567.1, "purpose": "fix the parser", "holder_stale": false, "intent": "edit", "caller_stamps": [{"name": "symbol:parse_token", "value": "…"}]}
 ```
 
 ### Claim semantics
@@ -77,6 +77,16 @@ with a `stale-claim` denial (holder is self) telling the agent to
 re-read and re-claim. Re-claiming re-binds the fingerprint to the
 current content; `release` drops it. No deliberate takeover exists: a
 claim lock is a content promise, not just a writer lock.
+
+A claim can also carry **caller stamps**: opaque `{name, value}` pairs
+you computed yourself — a symbol fingerprint, a hash, anything —
+attached with `stamps` on `claim_files` or `--stamp name=value` on the
+CLI (repeatable). zoanthrope stores caller stamps and re-checks only
+its own file stamp; verifying caller stamps is the caller's business.
+They come back on grants, in conflicts (a waiting agent sees what the
+holder pinned), in `list_claims`, and in `who_am_i`. A re-claim that
+passes stamps replaces the stored set outright; one without keeps the
+pins already set; `release` drops them with the claim.
 
 ### Filesystem leases (anti-clobbering)
 

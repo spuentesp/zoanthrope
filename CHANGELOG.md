@@ -3,6 +3,21 @@
 All notable changes to zoanthrope. Versions follow `vX.Y.Z` git tags
 (see `docs/RELEASING.md`).
 
+## 0.1.3 — unreleased
+
+- Caller stamps: a claim can carry opaque `{name, value}` stamps the
+  *caller* computed (`stamps` on `claim_files`, repeatable
+  `--stamp name=value` on `zoanthrope claim`). Stored as
+  `caller_stamps` in `state.json`, returned in the grant/conflict
+  shapes and from `list_claims`/`who_am_i`; audit lines carry stamp
+  names, never values. zoanthrope stores caller stamps and re-checks
+  only its own file stamp; verifying caller stamps is the caller's
+  business. A re-claim that passes stamps replaces the set wholesale
+  (no merging); a re-claim without stamps keeps the pins already set;
+  `release` drops them with the claim. The `stale-claim` denial is
+  unchanged — file stamp only — and old `state.json` files load with
+  an empty stamp set.
+
 ## 0.1.2 — 2026-10-12
 
 - File identity: one canonical claim key — absolute/relative/`..` spellings of the same file now resolve to a single claim (a lock whose key can duplicate is a broken lock).

@@ -10,7 +10,9 @@ use std::path::{Path, PathBuf};
 use serde_json::{json, Value};
 
 use crate::fs_lease;
-use crate::state::{self, Claim, ClaimIntent, ClaimOutcome, ContentStamp, RejoinReport};
+use crate::state::{
+    self, CallerStamp, Claim, ClaimIntent, ClaimOutcome, ContentStamp, RejoinReport,
+};
 
 const DEFAULT_AUDIT_LIMIT: usize = 200;
 
@@ -39,12 +41,16 @@ pub fn tool_defs() -> Vec<Value> {
              (default) or 'read'. A claim is refused when it conflicts with another agent's \
              recorded intent (edit conflicts with anything, read conflicts with edit) and the \
              response is the conflict shape {ok: false, holder, path, claimed_at, purpose, \
-             holder_stale, intent}. Claims are all-or-nothing per call. A stale holder still \
-             blocks — claims are never auto-released. A granted claim also takes the filesystem \
-             lease under .zoanthrope/locks/ (anti-clobbering) and binds the file's content \
-             fingerprint (mtime+size, sha256 for small files). stale_check=true (what the \
+             holder_stale, intent, caller_stamps}. Claims are all-or-nothing per call. A stale \
+             holder still blocks — claims are never auto-released. A granted claim also takes the \
+             filesystem lease under .zoanthrope/locks/ (anti-clobbering) and binds the file's \
+             content fingerprint (mtime+size, sha256 for small files). stale_check=true (what the \
              write guard passes) refuses with {ok: false, reason: 'stale-claim', holder} when \
-             the file changed under the caller's own claim — re-read, then re-claim to re-bind.",
+             the file changed under the caller's own claim — re-read, then re-claim to re-bind. \
+             stamps is an optional array of {name, value} caller-supplied opaque stamps stored \
+             on the claim and returned in grant/conflict/list shapes — zoanthrope never computes \
+             or verifies them. A re-claim with stamps replaces the stored set (no merging); a \
+             re-claim without stamps keeps the set already pinned.",
             json!({
                 "type": "object",
                 "properties": {
@@ -68,7 +74,19 @@ pub fn tool_defs() -> Vec<Value> {
                             ]
                         }
                     },
-                    "purpose": {"type": "string", "description": "Purpose for files that do not carry their own"}
+                    "purpose": {"type": "string", "description": "Purpose for files that do not carry their own"},
+                    "stamps": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "name": {"type": "string", "description": "Opaque stamp name (e.g. 'symbol:parse_token')"},
+                                "value": {"type": "string", "description": "Opaque stamp value the caller computed"}
+                            },
+                            "required": ["name", "value"]
+                        },
+                        "description": "Caller-supplied opaque stamps stored on the claim; zoanthrope stores and returns them, never verifies them"
+                    }
                 },
                 "required": ["agent_id"]
             }),
@@ -76,7 +94,8 @@ pub fn tool_defs() -> Vec<Value> {
         def(
             "list_claims",
             "List file claims across the workspace (or one agent's). Each entry carries \
-             {path, agent, intent, claimed_at, purpose, held_by_stale}.",
+             {path, agent, intent, claimed_at, purpose, held_by_stale, caller_stamps} — \
+             caller_stamps are the holder's opaque pins, returned for the caller to verify.",
             json!({
                 "type": "object",
                 "properties": {
@@ -86,7 +105,8 @@ pub fn tool_defs() -> Vec<Value> {
         ),
         def(
             "who_am_i",
-            "Identity and holdings of one agent: kind, last_seen, stale flag, claims, posts.",
+            "Identity and holdings of one agent: kind, last_seen, stale flag, claims (each \
+             with caller_stamps returned for the caller to verify), posts.",
             json!({
                 "type": "object",
                 "properties": {
@@ -282,6 +302,37 @@ fn claim_intent(args: &Value) -> Result<ClaimIntent, String> {
     }
 }
 
+/// `stamps` argument: absent/`null` means "leave the stored set alone"
+/// (a re-claim keeps what the caller pinned earlier); a present array —
+/// even an empty one — is the new set, replacing the old one wholesale.
+fn caller_stamps(args: &Value) -> Result<Option<Vec<CallerStamp>>, String> {
+    match args.get("stamps") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Array(items)) => {
+            let mut out = Vec::with_capacity(items.len());
+            for item in items {
+                let name = item
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| "stamps entries need a non-empty 'name'".to_string())?;
+                let value = item
+                    .get("value")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| format!("stamps entry '{name}' needs a non-empty 'value'"))?;
+                out.push(CallerStamp {
+                    name: name.to_string(),
+                    value: value.to_string(),
+                });
+            }
+            Ok(Some(out))
+        }
+        Some(_) => Err("stamps must be an array of {name, value} objects".into()),
+    }
+}
+
 struct FileReq {
     path: String,
     purpose: Option<String>,
@@ -356,9 +407,10 @@ fn claim_files(root: &Path, args: &Value) -> Result<Value, String> {
                 .get("stale_check")
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
+            let stamps = caller_stamps(args)?;
             let pairs: Vec<(String, Option<String>)> =
                 files.into_iter().map(|f| (f.path, f.purpose)).collect();
-            cli_claim_inner(root, &agent, &pairs, intent, stale_check)
+            cli_claim_inner(root, &agent, &pairs, intent, stale_check, stamps.as_deref())
         }
         "release" => {
             let files = file_list(args, common_purpose)?;
@@ -638,7 +690,8 @@ fn get_audit_log(root: &Path, args: &Value) -> Result<Value, String> {
 /// `zoanthrope claim` subcommand hooks shell out to. `stale_check`
 /// turns a fingerprint mismatch on the caller's own claim into a
 /// `stale-claim` refusal instead of a re-bind (what claim-guard.sh
-/// passes for every guarded write).
+/// passes for every guarded write). `stamps` is the caller's opaque
+/// pin set (`None` = leave whatever is pinned alone).
 pub fn cli_claim(
     root: PathBuf,
     agent: &str,
@@ -646,6 +699,7 @@ pub fn cli_claim(
     purpose: Option<&str>,
     intent: Option<&str>,
     stale_check: bool,
+    stamps: Option<Vec<CallerStamp>>,
 ) -> Value {
     let intent = match intent {
         None => ClaimIntent::Edit,
@@ -658,7 +712,7 @@ pub fn cli_claim(
         .iter()
         .map(|f| (f.clone(), purpose.map(str::to_string)))
         .collect();
-    cli_claim_inner(&root, agent, &pairs, intent, stale_check)
+    cli_claim_inner(&root, agent, &pairs, intent, stale_check, stamps.as_deref())
         .unwrap_or_else(|e| json!({"ok": false, "error": e}))
 }
 
@@ -684,6 +738,7 @@ fn cli_claim_inner(
     files: &[(String, Option<String>)],
     intent: ClaimIntent,
     stale_check: bool,
+    stamps: Option<&[CallerStamp]>,
 ) -> Result<Value, String> {
     let files = canon_pairs(root, files);
     state::update(root, |s| {
@@ -695,6 +750,8 @@ fn cli_claim_inner(
         // stale claim is left untouched — the recovery is re-read then
         // re-claim (a plain re-claim re-binds the fingerprint). No
         // deliberate takeover exists: a foreign claim is a conflict.
+        // Caller stamps play no part here: the guard re-checks only the
+        // file stamp zoanthrope computes itself.
         if stale_check {
             for (path, _) in &files {
                 let own = s
@@ -735,22 +792,24 @@ fn cli_claim_inner(
                 }
             }
         }
-        Ok(match s.claim(agent, &files, intent, now, ttl) {
-            ClaimOutcome::Granted(granted) => {
-                // Bind content at claim/re-claim time.
-                for (path, _) in &files {
-                    if let Some(c) = s
-                        .claims
-                        .iter_mut()
-                        .find(|c| c.agent == agent && &c.path == path)
-                    {
-                        c.fingerprint = Some(ContentStamp::capture(&abs_of(root, path)));
+        Ok(
+            match s.claim_with_stamps(agent, &files, intent, stamps, now, ttl) {
+                ClaimOutcome::Granted(granted) => {
+                    // Bind content at claim/re-claim time.
+                    for (path, _) in &files {
+                        if let Some(c) = s
+                            .claims
+                            .iter_mut()
+                            .find(|c| c.agent == agent && &c.path == path)
+                        {
+                            c.fingerprint = Some(ContentStamp::capture(&abs_of(root, path)));
+                        }
                     }
+                    grant_json(&granted)
                 }
-                grant_json(&granted)
-            }
-            ClaimOutcome::Conflict(c) => c.to_json(),
-        })
+                ClaimOutcome::Conflict(c) => c.to_json(),
+            },
+        )
     })
 }
 
@@ -785,6 +844,7 @@ fn grant_json(granted: &[Claim]) -> Value {
             "claimed_at": c.claimed_at,
             "purpose": c.purpose,
             "intent": c.intent.as_str(),
+            "caller_stamps": c.caller_stamps,
         })).collect::<Vec<_>>(),
     })
 }
@@ -856,14 +916,33 @@ pub fn status_text(root: &Path) -> String {
         } else {
             ""
         };
-        out.push_str(&format!(
-            "  {:<28} {}{} [{}]  purpose={}\n",
+        let mut line = format!(
+            "  {:<28} {}{} [{}]  purpose={}",
             c["path"].as_str().unwrap_or("?"),
             c["agent"].as_str().unwrap_or("?"),
             stale,
             c["intent"].as_str().unwrap_or("?"),
             c["purpose"].as_str().unwrap_or("-"),
-        ));
+        );
+        // Caller stamps are shown as pinned — opaque name=value pairs,
+        // stored for the caller to verify, never checked here.
+        if let Some(stamps) = c["caller_stamps"].as_array() {
+            if !stamps.is_empty() {
+                let pins: Vec<String> = stamps
+                    .iter()
+                    .map(|s| {
+                        format!(
+                            "{}={}",
+                            s["name"].as_str().unwrap_or("?"),
+                            s["value"].as_str().unwrap_or("?")
+                        )
+                    })
+                    .collect();
+                line.push_str(&format!("  stamps={}", pins.join(",")));
+            }
+        }
+        out.push_str(&line);
+        out.push('\n');
     }
 
     // The OS-level lease layer: what the filesystem itself says, for
@@ -965,6 +1044,7 @@ mod tests {
         assert_eq!(
             keys,
             vec![
+                "caller_stamps",
                 "claimed_at",
                 "holder",
                 "holder_stale",
@@ -1489,5 +1569,190 @@ mod tests {
         assert!(text.contains("postboard ("));
         assert!(text.contains("board: epoch "));
         assert!(text.contains("audit: "));
+    }
+
+    // ─── caller stamps ──────────────────────────────────────────────
+
+    #[test]
+    fn caller_stamps_round_trip_through_the_tool_surface() {
+        let root = temp_root("caller-stamps");
+        std::fs::write(root.join("a.rs"), "fn a() {}\n").unwrap();
+        let grant = call_tool(
+            &root,
+            "claim_files",
+            &json!({
+                "agent_id": "alpha",
+                "files": ["a.rs"],
+                "stamps": [{"name": "symbol:parse_token", "value": "deadbeef"}]
+            }),
+        )
+        .unwrap();
+        assert_eq!(grant["ok"], true);
+        assert_eq!(
+            grant["granted"][0]["caller_stamps"],
+            json!([{"name": "symbol:parse_token", "value": "deadbeef"}])
+        );
+
+        let who = call_tool(&root, "who_am_i", &json!({"agent_id": "alpha"})).unwrap();
+        assert_eq!(who["claims"][0]["caller_stamps"][0]["value"], "deadbeef");
+        let listed = call_tool(&root, "list_claims", &json!({})).unwrap();
+        assert_eq!(
+            listed["claims"][0]["caller_stamps"][0]["name"],
+            "symbol:parse_token"
+        );
+
+        // The waiting agent sees what the holder pinned.
+        let conflict = call_tool(
+            &root,
+            "claim_files",
+            &json!({"agent_id": "beta", "files": ["a.rs"]}),
+        )
+        .unwrap();
+        assert_eq!(conflict["ok"], false);
+        assert_eq!(
+            conflict["caller_stamps"],
+            json!([{"name": "symbol:parse_token", "value": "deadbeef"}])
+        );
+
+        // Re-claim replaces the set wholesale — no merging.
+        let again = call_tool(
+            &root,
+            "claim_files",
+            &json!({
+                "agent_id": "alpha",
+                "files": ["a.rs"],
+                "stamps": [{"name": "symbol:reparse", "value": "cafe"}]
+            }),
+        )
+        .unwrap();
+        assert_eq!(again["ok"], true);
+        assert_eq!(
+            again["granted"][0]["caller_stamps"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            again["granted"][0]["caller_stamps"][0]["name"],
+            "symbol:reparse"
+        );
+        let listed = call_tool(&root, "list_claims", &json!({})).unwrap();
+        assert_eq!(
+            listed["claims"][0]["caller_stamps"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            listed["claims"][0]["caller_stamps"][0]["name"],
+            "symbol:reparse"
+        );
+
+        // An explicit empty array clears the set.
+        let cleared = call_tool(
+            &root,
+            "claim_files",
+            &json!({"agent_id": "alpha", "files": ["a.rs"], "stamps": []}),
+        )
+        .unwrap();
+        assert_eq!(cleared["granted"][0]["caller_stamps"], json!([]));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn caller_stamps_never_touch_the_stale_claim_denial() {
+        // Stale-check compares only the file stamp zoanthrope recomputes.
+        // A caller-stamp change (re-claim with a different set) must not
+        // deny, and the denial shape itself stays byte-identical to 0.1.2.
+        let root = temp_root("stamps-stale");
+        std::fs::write(root.join("f.txt"), "seed\n").unwrap();
+        call_tool(
+            &root,
+            "claim_files",
+            &json!({
+                "agent_id": "alpha",
+                "files": ["f.txt"],
+                "stamps": [{"name": "symbol:parse_token", "value": "deadbeef"}]
+            }),
+        )
+        .unwrap();
+        // The caller's pin changes under an unchanged file: still fine.
+        let repinned = call_tool(
+            &root,
+            "claim_files",
+            &json!({
+                "agent_id": "alpha",
+                "files": ["f.txt"],
+                "stale_check": true,
+                "stamps": [{"name": "symbol:parse_token", "value": "0f0f"}]
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            repinned["ok"], true,
+            "stamp change is never a denial: {repinned}"
+        );
+        // A guarded call with no stamps argument passes too.
+        let plain = call_tool(
+            &root,
+            "claim_files",
+            &json!({"agent_id": "alpha", "files": ["f.txt"], "stale_check": true}),
+        )
+        .unwrap();
+        assert_eq!(plain["ok"], true, "{plain}");
+
+        // The file changes: the denial keys are exactly the 0.1.2 set.
+        std::fs::write(root.join("f.txt"), "seed\nmore\n").unwrap();
+        let denied = call_tool(
+            &root,
+            "claim_files",
+            &json!({"agent_id": "alpha", "files": ["f.txt"], "stale_check": true}),
+        )
+        .unwrap();
+        assert_eq!(denied["ok"], false);
+        assert_eq!(denied["reason"], "stale-claim");
+        let mut keys: Vec<&str> = denied
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec!["claimed_at", "hint", "holder", "ok", "path", "reason"]
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn stamps_argument_is_validated() {
+        let root = temp_root("stamps-validate");
+        assert!(call_tool(
+            &root,
+            "claim_files",
+            &json!({"agent_id": "a", "files": ["x"], "stamps": "nope"})
+        )
+        .is_err());
+        assert!(call_tool(
+            &root,
+            "claim_files",
+            &json!({"agent_id": "a", "files": ["x"], "stamps": [{"name": "n"}]})
+        )
+        .is_err());
+        assert!(call_tool(
+            &root,
+            "claim_files",
+            &json!({"agent_id": "a", "files": ["x"], "stamps": [{"name": "", "value": "v"}]})
+        )
+        .is_err());
+        assert!(call_tool(
+            &root,
+            "claim_files",
+            &json!({"agent_id": "a", "files": ["x"], "stamps": [{"name": "n", "value": ""}]})
+        )
+        .is_err());
     }
 }

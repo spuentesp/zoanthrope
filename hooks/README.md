@@ -101,7 +101,7 @@ with `holder` / `intent` / `claimed_at` — so a hook stays a one-liner
 and the agent can read who is in the way:
 
 ```json
-{"claimed_at":1791780567.1,"holder":"beta","holder_stale":false,"intent":"edit","ok":false,"path":"src/a.rs","purpose":"fix bug"}
+{"caller_stamps":[],"claimed_at":1791780567.1,"holder":"beta","holder_stale":false,"intent":"edit","ok":false,"path":"src/a.rs","purpose":"fix bug"}
 ```
 
 ## Reference hook
