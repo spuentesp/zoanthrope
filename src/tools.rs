@@ -732,6 +732,31 @@ pub fn cli_rejoin(root: PathBuf, agent: &str, files: Option<Vec<String>>) -> Val
     rejoin_agent(&root, &args).unwrap_or_else(|e| json!({"ok": false, "error": e}))
 }
 
+/// `state::update` with a brief busy retry. Lock acquisition failing
+/// on pure contention is plumbing: `claim_files` must answer grant or
+/// the conflict shape, never `could not lock: timed out`.
+/// `acquire_lock` already budgets for a full waiter queue; these extra
+/// passes cover the boundary where its deadline expires just as the
+/// holder releases. `f` runs at most once (a busy acquire fails before
+/// the closure is called).
+fn update_busy_retry<R>(
+    root: &Path,
+    mut f: impl FnMut(&mut state::State) -> Result<R, String>,
+) -> Result<R, String> {
+    const PASSES: u32 = 3;
+    const GAP: std::time::Duration = std::time::Duration::from_millis(150);
+    let mut pass = 0u32;
+    loop {
+        match state::update(root, &mut f) {
+            Err(e) if state::is_lock_busy(&e) && pass + 1 < PASSES => {
+                pass += 1;
+                std::thread::sleep(GAP);
+            }
+            out => return out,
+        }
+    }
+}
+
 fn cli_claim_inner(
     root: &Path,
     agent: &str,
@@ -741,7 +766,7 @@ fn cli_claim_inner(
     stamps: Option<&[CallerStamp]>,
 ) -> Result<Value, String> {
     let files = canon_pairs(root, files);
-    state::update(root, |s| {
+    update_busy_retry(root, |s| {
         let now = state::now_unix();
         let ttl = state::ttl_secs();
         s.register(agent, "other", now);
@@ -851,7 +876,7 @@ fn grant_json(granted: &[Claim]) -> Value {
 
 fn cli_release_inner(root: &Path, agent: &str, files: &[String]) -> Value {
     let files = canon_list(root, files);
-    match state::update(root, |s| {
+    match update_busy_retry(root, |s| {
         let now = state::now_unix();
         s.register(agent, "other", now);
         let released = s.release(agent, &files, now);

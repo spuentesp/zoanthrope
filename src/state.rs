@@ -42,9 +42,17 @@ const STATE_FILE: &str = "state.json";
 const LOCK_FILE: &str = ".lock";
 const LOCK_STALE_SECS: u64 = 10;
 
-/// Lock-acquire deadline. Equals the historical fixed-poll budget
-/// (250 polls x 20 ms), so when acquisition fails is unchanged.
-const LOCK_TIMEOUT: Duration = Duration::from_millis(5_000);
+/// Lock-acquire deadline under contention. Holders keep the lock only
+/// for a short read-modify-write, so a live process is guaranteed a
+/// turn well within this ceiling — the acquire loop keeps retrying
+/// with backoff until it elapses. The historical budget was 5 s (the
+/// fixed-poll 250 x 20 ms), which starved under multi-process
+/// contention and let `claim_files` surface `could not lock: timed
+/// out` — an infrastructure error for pure contention. A claim must
+/// grant or conflict instead; only a holder wedged while alive can
+/// burn this whole budget (a dead one is broken earlier by
+/// `LOCK_STALE_SECS`, which is unchanged).
+const LOCK_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Backoff for lock re-tries: start ~150 us, double up to the cap.
 const LOCK_BACKOFF_MIN: Duration = Duration::from_micros(150);
@@ -1128,9 +1136,8 @@ fn acquire_lock(root: &Path) -> Result<LockGuard, String> {
     let dir = state_dir(root);
     std::fs::create_dir_all(&dir).map_err(|e| format!("mkdir {}: {e}", dir.display()))?;
     let path = dir.join(LOCK_FILE);
-    // Exponential backoff instead of a fixed 20 ms poll: the deadline
-    // and stale-lock rules are the old ones (250 polls x 20 ms), only
-    // how eagerly we re-try changed.
+    // Exponential backoff instead of a fixed 20 ms poll: only how
+    // eagerly we re-try changed; the stale-lock rule is the old one.
     let deadline = Instant::now() + LOCK_TIMEOUT;
     let mut backoff = LOCK_BACKOFF_MIN;
     loop {
@@ -1163,6 +1170,14 @@ fn acquire_lock(root: &Path) -> Result<LockGuard, String> {
         }
     }
     Err(format!("could not lock {}: timed out", path.display()))
+}
+
+/// True when `err` is lock-acquisition *busy* — pure contention, not a
+/// plumbing fault. The claim path retries these instead of surfacing
+/// them: a claim under contention must grant or return the conflict
+/// shape, never an infrastructure error.
+pub fn is_lock_busy(err: &str) -> bool {
+    err.starts_with("could not lock ") && err.ends_with(": timed out")
 }
 
 /// Read-only access to the on-disk state.
