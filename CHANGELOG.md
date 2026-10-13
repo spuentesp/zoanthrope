@@ -3,7 +3,7 @@
 All notable changes to zoanthrope. Versions follow `vX.Y.Z` git tags
 (see `docs/RELEASING.md`).
 
-## 0.1.3 — unreleased
+## 0.1.3 — 2026-10-13
 
 - Caller stamps: a claim can carry opaque `{name, value}` stamps the
   *caller* computed (`stamps` on `claim_files`, repeatable
