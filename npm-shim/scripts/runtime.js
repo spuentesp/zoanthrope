@@ -3,8 +3,9 @@
 // Download-and-verify installer for the zoanthrope binary.
 // Node builtins only (https, crypto, fs, child_process) — no runtime
 // dependencies. Release assets are `zoanthrope-{target}.tar.gz` with
-// the bare `zoanthrope` binary at the archive root; `SHA256SUMS` in the
-// same release carries one checksum line per tarball.
+// the platform binary at the archive root — bare `zoanthrope` on
+// Linux/macOS, `zoanthrope.exe` on Windows; `SHA256SUMS` in the same
+// release carries one checksum line per tarball.
 
 const crypto = require('crypto');
 const fs = require('fs');
@@ -25,6 +26,10 @@ function targetFor(platform = process.platform, arch = process.arch) {
     'darwin-x64': 'x86_64-apple-darwin',
     'linux-arm64': 'aarch64-unknown-linux-gnu',
     'linux-x64': 'x86_64-unknown-linux-gnu',
+    // process.arch spells x86-64 `x64`, not `x86_64` — the tarball
+    // name comes from the rustc target triple, not the arch.
+    'win32-x64': 'x86_64-pc-windows-msvc',
+    'win32-arm64': 'aarch64-pc-windows-msvc',
   };
   const target = targets[`${platform}-${arch}`];
   if (!target) throw new Error(`No prebuilt zoanthrope binary for ${platform}-${arch}. ${BUILD_FROM_SOURCE}`);
@@ -154,8 +159,12 @@ async function ensureBinary(options = {}) {
     await fetch(releaseUrl(version, asset), archive);
     verifyArchive(archive, parseChecksum(fs.readFileSync(sums, 'utf8'), asset));
     execFileSync('tar', ['xzf', archive, '-C', temporary], { stdio: ['ignore', 'ignore', 'inherit'] });
-    const extracted = path.join(temporary, 'zoanthrope');
-    if (!fs.existsSync(extracted)) throw new Error(`${asset} does not contain the zoanthrope executable at its root`);
+    // On win32 the archive root carries `zoanthrope.exe` (spawning an
+    // extension-less file makes CreateProcess append .exe and miss the
+    // real file); everywhere else the bare name.
+    const extractedName = platform === 'win32' ? 'zoanthrope.exe' : 'zoanthrope';
+    const extracted = path.join(temporary, extractedName);
+    if (!fs.existsSync(extracted)) throw new Error(`${asset} does not contain the ${extractedName} executable at its root`);
     if (platform !== 'win32') fs.chmodSync(extracted, 0o755);
     verifyBinary(extracted, version);
     try {

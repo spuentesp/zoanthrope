@@ -1,6 +1,6 @@
 {
   "name": "@spuentesp/zoanthrope",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "mcpName": "io.github.spuentesp/zoanthrope",
   "description": "Swarm coordination: file claims, agent presence, postboard intentions, filesystem leases, audit. MCP server + hook CLI.",
   "keywords": [
@@ -26,7 +26,8 @@
     "README.md"
   ],
   "scripts": {
-    "postinstall": "node scripts/install.js"
+    "postinstall": "node scripts/install.js",
+    "test": "node --test scripts/install.test.js"
   },
   "engines": {
     "node": ">=18.0.0"

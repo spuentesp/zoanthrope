@@ -18,7 +18,8 @@ Environment knobs:
   (defaults to this package's version).
 - `ZOANTHROPE_CACHE_DIR` — override the binary cache directory.
 
-Prebuilt targets: Linux and macOS, x86_64 and aarch64. Anything else
+Prebuilt targets: Linux and macOS (x86_64, aarch64) and Windows
+(x86_64). Anything else
 (or a failed download) gets a build-from-source message:
 `cargo install --path .` from a clone of the repository.
 

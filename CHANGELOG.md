@@ -3,6 +3,18 @@
 All notable changes to zoanthrope. Versions follow `vX.Y.Z` git tags
 (see `docs/RELEASING.md`).
 
+## 0.1.5 — 2026-10-13
+
+- Windows target ships; npm installs now resolve a binary on win32.
+  The release matrix builds `x86_64-pc-windows-msvc` on
+  `windows-latest` (fifth tarball,
+  `zoanthrope-x86_64-pc-windows-msvc.tar.gz`, `.exe` at the archive
+  root); the npm shim maps `win32` x64/arm64 to the MSVC targets and
+  extracts/launches `zoanthrope.exe` (extension-less spawn made
+  CreateProcess append `.exe` and miss the file). Note: the
+  `aarch64-pc-windows-msvc` asset is not built yet — Windows-on-ARM
+  gets the 404 → build-from-source message.
+
 ## 0.1.3 — 2026-10-13
 
 - Caller stamps: a claim can carry opaque `{name, value}` stamps the
