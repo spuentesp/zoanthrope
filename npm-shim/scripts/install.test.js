@@ -7,7 +7,7 @@ const test = require('node:test');
 const assert = require('node:assert');
 const path = require('path');
 
-const { assetName, binaryPath, targetFor } = require('./runtime');
+const { assetName, binaryPath, targetFor, tarExecutable } = require('./runtime');
 
 test('targetFor maps win32-x64 to the MSVC target', () => {
   assert.strictEqual(targetFor('win32', 'x64'), 'x86_64-pc-windows-msvc');
@@ -54,4 +54,12 @@ test('targetFor keeps the pre-existing unix/darwin mappings', () => {
 test('targetFor rejects platforms with no prebuilt binary', () => {
   assert.throws(() => targetFor('win32', 'ia32'), /No prebuilt zoanthrope binary/);
   assert.throws(() => targetFor('freebsd', 'x64'), /No prebuilt zoanthrope binary/);
+});
+
+test('Windows extraction uses System32 bsdtar, not the first tar on PATH', () => {
+  const env = { SystemRoot: 'C:\\Windows' };
+  assert.strictEqual(tarExecutable('win32', env, () => true), 'C:\\Windows\\System32\\tar.exe');
+  assert.strictEqual(tarExecutable('win32', env, () => false), 'tar');
+  assert.strictEqual(tarExecutable('win32', {}, () => true), 'tar');
+  assert.strictEqual(tarExecutable('linux', env, () => true), 'tar');
 });

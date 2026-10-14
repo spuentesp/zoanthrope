@@ -98,6 +98,21 @@ function verifyBinary(file, version) {
   }
 }
 
+
+// On Windows the first `tar` on PATH (Git Bash's GNU tar on the shells
+// GitHub runners use) fails on these archives with `gzip: stdin:
+// unexpected end of file`. Windows ships bsdtar at System32\tar.exe;
+// use it when present — same fix as the lain shim.
+function tarExecutable(platform = process.platform, env = process.env, exists = fs.existsSync) {
+  if (platform !== 'win32') return 'tar';
+  const root = env.SystemRoot || env.SYSTEMROOT || env.windir || env.WINDIR;
+  if (root) {
+    const system = path.win32.join(root, 'System32', 'tar.exe');
+    if (exists(system)) return system;
+  }
+  return 'tar';
+}
+
 function download(url, destination, redirects = 5) {
   return new Promise((resolve, reject) => {
     const request = https.get(url, { headers: { 'User-Agent': '@spuentesp/zoanthrope' } }, (response) => {
@@ -158,7 +173,7 @@ async function ensureBinary(options = {}) {
     await fetch(releaseUrl(version, 'SHA256SUMS'), sums);
     await fetch(releaseUrl(version, asset), archive);
     verifyArchive(archive, parseChecksum(fs.readFileSync(sums, 'utf8'), asset));
-    execFileSync('tar', ['xzf', archive, '-C', temporary], { stdio: ['ignore', 'ignore', 'inherit'] });
+    execFileSync(tarExecutable(platform), ['xzf', archive, '-C', temporary], { stdio: ['ignore', 'ignore', 'inherit'] });
     // On win32 the archive root carries `zoanthrope.exe` (spawning an
     // extension-less file makes CreateProcess append .exe and miss the
     // real file); everywhere else the bare name.
@@ -199,6 +214,7 @@ module.exports = {
   releaseUrl,
   selectedVersion,
   sha256,
+  tarExecutable,
   targetFor,
   verifyArchive,
   verifyBinary,
