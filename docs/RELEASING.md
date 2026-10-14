@@ -71,14 +71,15 @@ TLA2TOOLS_JAR=/path/to/tla2tools.jar formal/check.sh
 |---|---|
 | `ci-status-check` | refuses to release a commit without a green completed CI run on `main` |
 | `version-check` | tag vs `Cargo.toml` / `npm-shim/package.json` / `server.json` |
-| `build` (×4) | release binaries for Linux/macOS × x86_64/aarch64 → `zoanthrope-{target}.tar.gz` + per-artifact `.sha256` |
+| `build` (×5) | release binaries for Linux/macOS × x86_64/aarch64 plus Windows x86_64 → `zoanthrope-{target}.tar.gz` + per-artifact `.sha256` |
 | `release` | aggregate `SHA256SUMS`, compose notes from `docs/release-notes-template.md`, `gh`-release the assets (created only after **all** builds pass) |
 | `publish-npm` | `npm publish --provenance --access public` via OIDC (no `NPM_TOKEN`) |
 | `publish-npm-retry` | `workflow_dispatch` escape hatch: re-publish npm for an existing tag without rebuilding |
 
 Asset-name contract (the npm shim downloads exactly this):
-`zoanthrope-{target}.tar.gz` with the bare `zoanthrope` binary at the
-archive root, checksums in `SHA256SUMS`.
+`zoanthrope-{target}.tar.gz` with the platform binary at the archive
+root — bare `zoanthrope` on Linux/macOS, `zoanthrope.exe` on Windows —
+checksums in `SHA256SUMS`.
 
 ## npm trusted publishing (OIDC) — one-time owner configuration
 
@@ -144,7 +145,7 @@ bumping versions (the `version-check` job enforces it).
 
 1. **CI green** on the `main` commit (`lint`, `test`, `tlc`, `chaos-smoke`).
 2. **Tag**: `git tag vX.Y.Z && git push origin vX.Y.Z`.
-3. **Release assets**: `release.yml` builds the four tarballs,
+3. **Release assets**: `release.yml` builds the five tarballs,
    `SHA256SUMS`, and the GitHub Release.
 4. **npm**: `publish-npm` publishes `@spuentesp/zoanthrope` (verify at
    `https://www.npmjs.com/package/@spuentesp/zoanthrope`; a broken

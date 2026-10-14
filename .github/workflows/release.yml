@@ -94,9 +94,10 @@ jobs:
           print(f"all version fields match {tag}")
           PY
 
-  # Prebuilt binaries for the four supported targets. macOS x86_64 is
+  # Prebuilt binaries for the five supported targets. macOS x86_64 is
   # cross-compiled on the arm64 runner (the Apple SDK is universal); the
-  # Linux aarch64 cell runs on GitHub's free arm64 runner.
+  # Linux aarch64 cell runs on GitHub's free arm64 runner; Windows runs
+  # natively on windows-latest (MSVC toolchain, no cross-compile).
   build:
     name: Build (${{ matrix.target }})
     needs: version-check
@@ -117,6 +118,8 @@ jobs:
             target: x86_64-apple-darwin
           - os: macos-latest
             target: aarch64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
@@ -126,17 +129,33 @@ jobs:
       - name: Build release binary
         run: cargo build --release --target ${{ matrix.target }}
       - name: Package tarball + per-artifact sha256
+        # bash on every runner: the script uses POSIX syntax and the
+        # Windows cell would otherwise default to PowerShell.
+        shell: bash
         run: |
           set -euo pipefail
+          # Windows targets build zoanthrope.exe; every other target
+          # builds a bare zoanthrope. The .exe keeps its name inside
+          # the tarball — npm-shim/scripts/runtime.js expects it there
+          # on win32.
+          bin="zoanthrope"
+          case "${{ matrix.target }}" in
+            *windows*) bin="zoanthrope.exe" ;;
+          esac
           stage="${RUNNER_TEMP}/stage"
           mkdir -p "$stage"
-          cp "target/${{ matrix.target }}/release/zoanthrope" "$stage/zoanthrope"
-          chmod 755 "$stage/zoanthrope"
+          cp "target/${{ matrix.target }}/release/$bin" "$stage/$bin"
+          chmod 755 "$stage/$bin"
           # Asset name contract (npm-shim/scripts/runtime.js downloads
-          # exactly this): zoanthrope-{target}.tar.gz with the bare
-          # `zoanthrope` binary at the archive root.
-          tar czf "zoanthrope-${{ matrix.target }}.tar.gz" -C "$stage" zoanthrope
-          python3 -c "import hashlib,pathlib,sys; p=pathlib.Path(sys.argv[1]); p.with_name(p.name+'.sha256').write_text(hashlib.sha256(p.read_bytes()).hexdigest()+'  '+p.name+'\n')" "zoanthrope-${{ matrix.target }}.tar.gz"
+          # exactly this): zoanthrope-{target}.tar.gz with the platform
+          # binary (zoanthrope, or zoanthrope.exe on Windows) at the
+          # archive root.
+          tar czf "zoanthrope-${{ matrix.target }}.tar.gz" -C "$stage" "$bin"
+          # sha256sum (GNU coreutils, present on ubuntu and the Windows
+          # runners' Git Bash) emits the same `hash  name` line the old
+          # python3 one-liner wrote; python3 is not guaranteed in bash
+          # on Windows.
+          sha256sum "zoanthrope-${{ matrix.target }}.tar.gz" > "zoanthrope-${{ matrix.target }}.tar.gz.sha256"
           cat "zoanthrope-${{ matrix.target }}.tar.gz.sha256"
       - uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
         with:

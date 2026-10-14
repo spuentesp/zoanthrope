@@ -1,6 +1,6 @@
 [package]
 name = "zoanthrope"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2021"
 description = "Swarm-coordination MCP server: file claims, agent presence, postboard intentions, filesystem leases, audit."
 license = "MIT"
