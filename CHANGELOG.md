@@ -15,6 +15,10 @@ All notable changes to zoanthrope. Versions follow `vX.Y.Z` git tags
   `aarch64-pc-windows-msvc` asset is not built yet — Windows-on-ARM
   gets the 404 → build-from-source message.
 
+## 0.1.4 — 2026-10-13
+
+- Claims survive state-lock contention (acquire ceiling 5s→30s + busy-retry): grant or conflict, never plumbing errors.
+
 ## 0.1.3 — 2026-10-13
 
 - Caller stamps: a claim can carry opaque `{name, value}` stamps the
