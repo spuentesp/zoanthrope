@@ -49,8 +49,7 @@ env:
   # in the repo (4.5 MB binary blob): the CI job downloads the official
   # v1.8.0 release and pins it by SHA256 — a mismatch fails the job.
   # Local runs: `TLA2TOOLS_JAR=/path/to/tla2tools.jar ./check.sh`.
-  TLA2TOOLS_VERSION: '1.8.0'
-  TLA2TOOLS_SHA256: 'c0d2f72abc30e92871bb16c56f6878612eccd936bf7ca5fa7e4e324200a0a5c4'
+  # (jar vendored at formal/tla2tools.jar — no download, no pin)
 
 permissions:
   contents: read
@@ -99,14 +98,11 @@ jobs:
           distribution: temurin
           java-version: '17'
           java-package: jre
-      - name: Fetch tla2tools.jar (pinned by SHA256)
-        run: |
-          set -euo pipefail
-          curl -fsSL -o "$RUNNER_TEMP/tla2tools.jar" \
-            "https://github.com/tlaplus/tlaplus/releases/download/v${TLA2TOOLS_VERSION}/tla2tools.jar"
-          echo "${TLA2TOOLS_SHA256}  $RUNNER_TEMP/tla2tools.jar" | sha256sum -c -
+      # The jar is VENDORED at formal/tla2tools.jar (git-pinned): the
+      # upstream GitHub release asset was re-uploaded three times in one
+      # day and broke SHA pins twice. Lain vendors the same artifact.
       - name: Run TLC over formal/MANIFEST
-        run: cd formal && TLA2TOOLS_JAR="$RUNNER_TEMP/tla2tools.jar" ./check.sh
+        run: cd formal && TLA2TOOLS_JAR="$GITHUB_WORKSPACE/formal/tla2tools.jar" ./check.sh
 
   # The fast harness lane: 2 workers x 8 iters, both modes (claim and
   # the stomp positive control). Runs in seconds; the heavyweight
