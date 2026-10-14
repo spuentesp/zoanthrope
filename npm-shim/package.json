@@ -1,6 +1,6 @@
 {
   "name": "@spuentesp/zoanthrope",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "mcpName": "io.github.spuentesp/zoanthrope",
   "description": "Swarm coordination: file claims, agent presence, postboard intentions, filesystem leases, audit. MCP server + hook CLI.",
   "keywords": [

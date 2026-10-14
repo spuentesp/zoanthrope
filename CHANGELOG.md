@@ -3,6 +3,13 @@
 All notable changes to zoanthrope. Versions follow `vX.Y.Z` git tags
 (see `docs/RELEASING.md`).
 
+## 0.1.6 — 2026-10-14
+
+- Windows extraction uses `C:\Windows\System32\tar.exe` (bsdtar) instead
+  of the first `tar` on PATH. GNU tar from Git Bash dies on the release
+  tarballs with `gzip: unexpected end of file`; System32 bsdtar extracts
+  them correctly. Falls back to `tar` when System32 tar is absent.
+
 ## 0.1.5 — 2026-10-13
 
 - Windows target ships; npm installs now resolve a binary on win32.
